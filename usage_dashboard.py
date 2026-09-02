@@ -32,25 +32,43 @@ TEMPLATE = Path(__file__).parent / "template.html"
 SUBSCRIPTION_MONTHLY = 20.00
 SUBSCRIPTION_NAME = "Pro"
 
-# API prices, USD per million tokens: (input, output).
-# Cache pricing multiplies the input rate: 5m write x1.25, 1h write x2, read x0.1.
-PRICING = {
-    "fable":  (10.0, 50.0),
-    "mythos": (10.0, 50.0),
-    "opus":   (5.0, 25.0),
-    "sonnet": (3.0, 15.0),
-    "haiku":  (1.0, 5.0),
-}
-CACHE_W5, CACHE_W1, CACHE_R = 1.25, 2.0, 0.10
-WEB_SEARCH_PER_1K = 10.0  # $10 per 1,000 searches
+# API prices, USD per million tokens: (input, output, cache-read multiplier).
+# Matched as substrings against the model id, first hit wins, so the more
+# specific key must come first ("opus-4-1" before "opus").
+# Cache writes multiply the input rate: 5m x1.25, 1h x2. Cache reads are x0.1
+# everywhere except Fable/Mythos 5.1, which read at x0.025 ($0.25/MTok).
+PRICING = (
+    ("fable-5-1",  10.0, 50.0, 0.025),
+    ("mythos-5-1", 10.0, 50.0, 0.025),
+    ("fable",      10.0, 50.0, 0.10),
+    ("mythos",     10.0, 50.0, 0.10),
+    ("opus-4-1",   15.0, 75.0, 0.10),  # retired; only in old transcripts
+    ("opus",        5.0, 25.0, 0.10),
+    ("sonnet-5",    2.0, 10.0, 0.10),
+    ("sonnet",      3.0, 15.0, 0.10),
+    ("haiku-3-5",   0.8,  4.0, 0.10),  # retired
+    ("haiku",       1.0,  5.0, 0.10),
+)
+UNKNOWN_RATES = (5.0, 25.0, 0.10)  # unknown model: assume Opus-tier
+
+# Fast mode (research preview) bills Opus 5 / 4.8 at premium rates; the cache
+# multipliers above stack on top of these. Transcripts record usage.speed.
+FAST_RATES = (10.0, 50.0)
+FAST_MODELS = ("opus-5", "opus-4-8")
+
+CACHE_W5, CACHE_W1 = 1.25, 2.0
+WEB_SEARCH_PER_1K = 10.0  # $10 per 1,000 searches. Web fetch is free.
 
 
-def rates_for(model: str) -> tuple[float, float]:
+def rates_for(model: str, speed: str = "standard") -> tuple[float, float, float]:
+    """(input, output, cache-read multiplier) per MTok for a model id."""
     m = model.lower()
-    for key, r in PRICING.items():
-        if key in m:
-            return r
-    return PRICING["opus"]  # unknown model: assume Opus-tier
+    rin, rout, cache_r = next(
+        ((i, o, c) for key, i, o, c in PRICING if key in m), UNKNOWN_RATES
+    )
+    if speed == "fast" and any(k in m for k in FAST_MODELS):
+        rin, rout = FAST_RATES
+    return rin, rout, cache_r
 
 
 def local_date(ts: str) -> str:
@@ -120,26 +138,29 @@ def parse() -> dict:
         if c5 is None:  # no breakdown: bill the lump sum as 5m writes
             c5, c1 = u.get("cache_creation_input_tokens", 0), 0
         st = u.get("server_tool_use") or {}
-        a = agg[(local_date(ent["ts"]), ent["model"], proj_names.get(ent["proj"], ent["proj"]))]
+        speed = u.get("speed", "standard")
+        a = agg[(local_date(ent["ts"]), ent["model"], speed,
+                 proj_names.get(ent["proj"], ent["proj"]))]
         a["n"] += 1
         a["ti"] += u.get("input_tokens", 0)
         a["to"] += u.get("output_tokens", 0)
         a["c5"] += c5
         a["c1"] += c1
         a["cr"] += u.get("cache_read_input_tokens", 0)
-        a["ws"] += st.get("web_search_requests", 0) + st.get("web_fetch_requests", 0)
+        a["ws"] += st.get("web_search_requests", 0)  # web fetch costs nothing
 
     records = []
-    for (d, model, proj), a in sorted(agg.items()):
-        rin, rout = rates_for(model)
+    for (d, model, speed, proj), a in sorted(agg.items()):
+        rin, rout, cache_r = rates_for(model, speed)
         cost = (
             a["ti"] * rin
             + a["to"] * rout
             + a["c5"] * rin * CACHE_W5
             + a["c1"] * rin * CACHE_W1
-            + a["cr"] * rin * CACHE_R
+            + a["cr"] * rin * cache_r
         ) / 1e6 + a["ws"] * WEB_SEARCH_PER_1K / 1000
-        records.append({"d": d, "m": model, "p": proj, **a, "cost": round(cost, 4)})
+        label = f"{model} (fast)" if speed == "fast" else model
+        records.append({"d": d, "m": label, "p": proj, **a, "cost": round(cost, 4)})
 
     return {
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),

@@ -29,15 +29,36 @@ Each assistant message in the transcripts carries a `usage` block. Duplicated
 streaming lines are deduped on `(requestId, message.id)`; subagent transcripts
 (`<session>/subagents/*.jsonl`) are included. Per model, per MTok:
 
-| Model  | Input | Output | Cache write 5m (×1.25) | Cache write 1h (×2) | Cache read (×0.1) |
-|--------|------:|-------:|-----------------------:|--------------------:|------------------:|
-| Fable  | $10   | $50    | $12.50                 | $20                 | $1.00             |
-| Opus   | $5    | $25    | $6.25                  | $10                 | $0.50             |
-| Sonnet | $3    | $15    | $3.75                  | $6                  | $0.30             |
-| Haiku  | $1    | $5     | $1.25                  | $2                  | $0.10             |
+| Model              | Input | Output | Cache write 5m (×1.25) | Cache write 1h (×2) | Cache read |
+|--------------------|------:|-------:|-----------------------:|--------------------:|-----------:|
+| Fable / Mythos 5.1 | $10   | $50    | $12.50                 | $20                 | $0.25¹     |
+| Fable / Mythos 5   | $10   | $50    | $12.50                 | $20                 | $1.00      |
+| Opus 5 / 4.8 / 4.7 | $5    | $25    | $6.25                  | $10                 | $0.50      |
+| Sonnet 5           | $2    | $10    | $2.50                  | $4                  | $0.20      |
+| Sonnet 4.6         | $3    | $15    | $3.75                  | $6                  | $0.30      |
+| Haiku 4.5          | $1    | $5     | $1.25                  | $2                  | $0.10      |
 
-Web search/fetch requests are billed at $10 per 1,000. Estimates use standard
-(non-batch) rates; unknown models fall back to Opus pricing.
+¹ Cache reads are ×0.1 of the input rate on every model **except** Fable 5.1 and
+Mythos 5.1, which read at ×0.025. This matters: cache reads are ~95% of all
+tokens Claude Code sends, so applying the wrong multiplier skews the total more
+than any other rate here.
+
+Rates are version-aware — the model id is matched most-specific-first, so
+`claude-sonnet-5` prices at $2/$10 while `claude-sonnet-4-6` prices at $3/$15.
+Retired models (Opus 4.1, Haiku 3.5) keep their own rates for older transcripts;
+anything unrecognized falls back to Opus-tier.
+
+**Fast mode** (`usage.speed == "fast"`, research preview on Opus 5 / 4.8) bills
+at $10/$50 with the cache multipliers stacked on top; those rows are labelled
+`<model> (fast)` in the output.
+
+**Web search** costs $10 per 1,000 searches. **Web fetch is free** — you only pay
+for the fetched content as input tokens, so `web_fetch_requests` is not billed.
+
+The full 1M-token context window is charged at standard rates on Claude 4.6 and
+later, so there is no long-context premium tier to account for. Estimates use
+standard (non-batch) rates and assume global routing (no `inference_geo: "us"`
+1.1× data-residency multiplier).
 
 The subscription comparison assumes **Pro at $20/month**, prorated over the
 selected range — edit `SUBSCRIPTION_MONTHLY` / `SUBSCRIPTION_NAME` at the top of
