@@ -6,13 +6,8 @@ this file is for things that aren't obvious from the code.
 ## Tracker
 
 Tracked under epic **[JMR-82] Claude Use Monitor** (Jira, `JMR` project).
-File new work as a child of JMR-82 rather than as a loose issue.
-
-Open children:
-
-- **JMR-83** — Deploy as executable
-- **JMR-84** — Keep usage history in SQLite (PR #2)
-- **JMR-85** — Count web searches the transcripts don't bill
+File new work as a child of JMR-82 rather than as a loose issue; find open work
+with JQL `parent = JMR-82 AND statusCategory != Done`.
 
 Repo: <https://github.com/goldeneye13/ClaudeUse>
 
