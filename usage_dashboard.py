@@ -293,6 +293,11 @@ def main() -> None:
 
         class H(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
+                # only the page itself triggers an import; the browser's
+                # automatic /favicon.ico request would otherwise redo it
+                if self.path.split("?")[0] != "/":
+                    self.send_error(404)
+                    return
                 body = render(collect(args.db)).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
