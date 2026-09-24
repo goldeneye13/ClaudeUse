@@ -6,11 +6,8 @@ this file is for things that aren't obvious from the code.
 ## Tracker
 
 Tracked under epic **[JMR-82] Claude Use Monitor** (Jira, `JMR` project).
-File new work as a child of JMR-82 rather than as a loose issue.
-
-Open children:
-
-- **JMR-83** — Deploy as executable
+File new work as a child of JMR-82 rather than as a loose issue; find open work
+with JQL `parent = JMR-82 AND statusCategory != Done`.
 
 Repo: <https://github.com/goldeneye13/ClaudeUse>
 
@@ -34,7 +31,7 @@ long-context premium tier on Claude 4.6+ — the full 1M window is standard rate
 ## Conventions
 
 - **Standard library only.** No dependencies; keep it that way.
-- **Never commit `dashboard.html`.** It's generated output and it embeds real
-  local project paths. It's gitignored — leave it that way.
+- **Never commit `dashboard.html` or `*.sqlite`.** Generated output that embeds
+  real local project paths. Both are gitignored — leave it that way.
 - Any rate change should be sanity-checked with a real run
   (`python usage_dashboard.py --no-open`) before committing.

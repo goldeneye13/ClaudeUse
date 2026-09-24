@@ -219,3 +219,4 @@ __marimo__/
 
 # Generated dashboard (embeds local project paths — regenerate with usage_dashboard.py)
 dashboard.html
+*.sqlite

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Claude Code usage dashboard.
 
-Parses the local Claude Code transcripts (~/.claude/projects/**/*.jsonl),
-aggregates token usage per model / project / day, prices it at API rates
-(including prompt-cache write/read pricing), and renders a self-contained
-HTML dashboard.
+Copies the local Claude Code transcripts (~/.claude/projects/**/*.jsonl) into
+a permanent SQLite history, aggregates token usage per model / project / day,
+prices it at API rates (including prompt-cache write/read pricing), and renders
+a self-contained HTML dashboard.
 
 Usage:
     python usage_dashboard.py            # generate dashboard.html and open it
     python usage_dashboard.py --no-open  # just generate
     python usage_dashboard.py --serve    # serve on http://localhost:8377 (regenerates per request)
+    python usage_dashboard.py --import-only  # just update the history DB
 
 No dependencies beyond the standard library.
 """
@@ -18,15 +19,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 import webbrowser
-from collections import Counter, defaultdict
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 OUT_HTML = Path(__file__).parent / "dashboard.html"
 TEMPLATE = Path(__file__).parent / "template.html"
+# Permanent history: Claude Code deletes transcripts after cleanupPeriodDays
+# (default 30), so every run copies them into this DB first. Override with --db.
+DEFAULT_DB = (Path.home() / "Files" / "eLibrary" / "IT" / "LLM Usage"
+              / "claude_code_usage.sqlite")
 
 # What you actually pay for the subscription, USD/month. Change if you're on Max.
 SUBSCRIPTION_MONTHLY = 20.00
@@ -83,15 +89,35 @@ def short_path(p: str) -> str:
     return p
 
 
-def parse() -> dict:
-    """Scan every transcript, dedupe streamed duplicates, aggregate per (day, model, project)."""
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages (
+    key         TEXT PRIMARY KEY,  -- requestId:message.id (dedupes streamed lines)
+    ts          TEXT NOT NULL,     -- ISO-8601 UTC, as written in the transcript
+    model       TEXT NOT NULL,
+    speed       TEXT NOT NULL,     -- standard | fast
+    project_dir TEXT NOT NULL,     -- folder name under ~/.claude/projects
+    cwd         TEXT,
+    input       INTEGER NOT NULL,
+    output      INTEGER NOT NULL,
+    cache_5m    INTEGER NOT NULL,
+    cache_1h    INTEGER NOT NULL,
+    cache_read  INTEGER NOT NULL,
+    web_search  INTEGER NOT NULL,
+    imported_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
+"""
+SCHEMA_VERSION = 1
+
+
+def scan() -> dict[str, tuple]:
+    """Read every transcript into {dedupe key: row} with token counts split out."""
     if not CLAUDE_PROJECTS.is_dir():
         sys.exit(f"Not found: {CLAUDE_PROJECTS} - is Claude Code installed?")
 
-    # project folder -> most common cwd seen inside it (nicer display name)
-    cwd_votes: dict[str, Counter] = defaultdict(Counter)
-    # dedupe key -> parsed entry (same message can be written on several lines while streaming)
-    entries: dict[str, dict] = {}
+    # dedupe key -> row (same message can be written on several lines while
+    # streaming; the last line wins, as before)
+    rows: dict[str, tuple] = {}
 
     for f in CLAUDE_PROJECTS.rglob("*.jsonl"):
         # project = top-level folder (subagent transcripts nest deeper)
@@ -105,49 +131,90 @@ def parse() -> dict:
                 except json.JSONDecodeError:
                     continue
                 msg = e.get("message") or {}
-                usage = msg.get("usage")
+                u = msg.get("usage")
                 model = msg.get("model", "")
-                if not usage or not model or model == "<synthetic>":
+                ts = e.get("timestamp", "")
+                if not u or not model or model == "<synthetic>" or not ts:
                     continue
-                if e.get("cwd"):
-                    cwd_votes[proj_dir][e["cwd"]] += 1
+                cc = u.get("cache_creation") or {}
+                c5 = cc.get("ephemeral_5m_input_tokens")
+                c1 = cc.get("ephemeral_1h_input_tokens", 0)
+                if c5 is None:  # no breakdown: bill the lump sum as 5m writes
+                    c5, c1 = u.get("cache_creation_input_tokens", 0), 0
+                st = u.get("server_tool_use") or {}
                 key = f'{e.get("requestId", "")}:{msg.get("id") or e.get("uuid")}'
-                entries[key] = {
-                    "ts": e.get("timestamp", ""),
-                    "model": model,
-                    "proj": proj_dir,
-                    "usage": usage,
-                }
+                rows[key] = (
+                    key, ts, model, u.get("speed", "standard"), proj_dir, e.get("cwd"),
+                    u.get("input_tokens", 0), u.get("output_tokens", 0), c5, c1,
+                    u.get("cache_read_input_tokens", 0),
+                    st.get("web_search_requests", 0),  # web fetch costs nothing
+                )
+    return rows
 
-    proj_names = {
-        d: short_path(votes.most_common(1)[0][0]) if votes else d
-        for d, votes in cwd_votes.items()
-    }
 
-    # aggregate: (date, model, project) -> sums
+def open_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.executescript(SCHEMA)
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    return conn
+
+
+def import_transcripts(db: Path) -> None:
+    """Upsert everything the transcripts still hold into the history DB.
+
+    Messages whose transcripts Claude Code has since deleted stay in the DB -
+    that's the point. Messages still on disk are replaced, so re-runs are safe.
+    """
+    rows = scan()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn = open_db(db)
+    try:
+        before = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        with conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (r + (now,) for r in rows.values()),
+            )
+        after = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    finally:
+        conn.close()
+    print(f"{db}: {after - before:,} new messages, {after:,} stored")
+
+
+def aggregate(db: Path) -> dict:
+    """Aggregate every stored message per (day, model, project) and price it."""
+    conn = open_db(db)
+    try:
+        # project folder -> most common cwd seen inside it (nicer display name);
+        # ascending count, so the most common one is written last and wins
+        proj_names = {
+            proj_dir: short_path(cwd)
+            for proj_dir, cwd, _ in conn.execute(
+                "SELECT project_dir, cwd, COUNT(*) AS n FROM messages"
+                " WHERE cwd IS NOT NULL GROUP BY project_dir, cwd ORDER BY n"
+            )
+        }
+        msgs = conn.execute(
+            "SELECT ts, model, speed, project_dir, input, output,"
+            " cache_5m, cache_1h, cache_read, web_search FROM messages"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # aggregate: (date, model, speed, project) -> sums
     agg: dict[tuple, dict] = defaultdict(
         lambda: {"n": 0, "ti": 0, "to": 0, "c5": 0, "c1": 0, "cr": 0, "ws": 0}
     )
-    for ent in entries.values():
-        if not ent["ts"]:
-            continue
-        u = ent["usage"]
-        cc = u.get("cache_creation") or {}
-        c5 = cc.get("ephemeral_5m_input_tokens")
-        c1 = cc.get("ephemeral_1h_input_tokens", 0)
-        if c5 is None:  # no breakdown: bill the lump sum as 5m writes
-            c5, c1 = u.get("cache_creation_input_tokens", 0), 0
-        st = u.get("server_tool_use") or {}
-        speed = u.get("speed", "standard")
-        a = agg[(local_date(ent["ts"]), ent["model"], speed,
-                 proj_names.get(ent["proj"], ent["proj"]))]
+    for ts, model, speed, proj, ti, to, c5, c1, cr, ws in msgs:
+        a = agg[(local_date(ts), model, speed, proj_names.get(proj, proj))]
         a["n"] += 1
-        a["ti"] += u.get("input_tokens", 0)
-        a["to"] += u.get("output_tokens", 0)
+        a["ti"] += ti
+        a["to"] += to
         a["c5"] += c5
         a["c1"] += c1
-        a["cr"] += u.get("cache_read_input_tokens", 0)
-        a["ws"] += st.get("web_search_requests", 0)  # web fetch costs nothing
+        a["cr"] += cr
+        a["ws"] += ws
 
     records = []
     for (d, model, speed, proj), a in sorted(agg.items()):
@@ -168,6 +235,12 @@ def parse() -> dict:
         "subName": SUBSCRIPTION_NAME,
         "records": records,
     }
+
+
+def collect(db: Path) -> dict:
+    """Copy new transcript data into the history DB, then aggregate all of it."""
+    import_transcripts(db)
+    return aggregate(db)
 
 
 def render(data: dict) -> str:
@@ -205,14 +278,27 @@ def main() -> None:
     ap.add_argument("--no-open", action="store_true", help="don't open the browser")
     ap.add_argument("--serve", action="store_true", help="serve instead of writing a file")
     ap.add_argument("--port", type=int, default=8377)
+    ap.add_argument("--db", type=Path, default=DEFAULT_DB,
+                    help=f"usage history database (default: {DEFAULT_DB})")
+    ap.add_argument("--import-only", action="store_true",
+                    help="copy new transcript data into the DB and exit (for a scheduled task)")
     args = ap.parse_args()
+
+    if args.import_only:
+        import_transcripts(args.db)
+        return
 
     if args.serve:
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
         class H(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
-                body = render(parse()).encode("utf-8")
+                # only the page itself triggers an import; the browser's
+                # automatic /favicon.ico request would otherwise redo it
+                if self.path.split("?")[0] != "/":
+                    self.send_error(404)
+                    return
+                body = render(collect(args.db)).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -227,7 +313,7 @@ def main() -> None:
             webbrowser.open(f"http://localhost:{args.port}")
         HTTPServer(("127.0.0.1", args.port), H).serve_forever()
     else:
-        data = parse()
+        data = collect(args.db)
         OUT_HTML.write_text(render(data), encoding="utf-8")
         print_summary(data)
         print(f"\nWrote {OUT_HTML}")
