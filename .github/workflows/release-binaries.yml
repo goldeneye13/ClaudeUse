@@ -1,0 +1,78 @@
+# Builds standalone executables with PyInstaller and attaches them to a release.
+#   release published -> build and upload to that release
+#   manual run        -> build and upload to the given tag (backfill old releases)
+#   pull request      -> build and smoke-test only; binaries kept as workflow artifacts
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to attach binaries to
+        required: true
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: ClaudeUse-windows-x64.exe
+          # oldest supported runner = oldest glibc = runs on more distros
+          - os: ubuntu-22.04
+            asset: ClaudeUse-linux-x64.tar.gz
+          - os: macos-latest
+            asset: ClaudeUse-macos-arm64.tar.gz
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG || github.ref }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - run: pip install pyinstaller
+
+      - name: Build
+        run: pyinstaller --onefile --name ClaudeUse --add-data "template.html:." usage_dashboard.py
+
+      - name: Smoke test
+        run: |
+          mkdir -p ~/.claude/projects
+          dist/ClaudeUse --no-open --db "$RUNNER_TEMP/smoke.sqlite"
+          test -s dist/dashboard.html
+
+      # tar keeps the executable bit, which a bare download would lose
+      - name: Package
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            mv dist/ClaudeUse.exe "${{ matrix.asset }}"
+          else
+            tar -czf "${{ matrix.asset }}" -C dist ClaudeUse
+          fi
+
+      - name: Upload to release
+        if: env.TAG != ''
+        run: gh release upload "$TAG" "${{ matrix.asset }}" --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Keep as workflow artifact
+        if: env.TAG == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}

@@ -27,7 +27,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
-OUT_HTML = Path(__file__).parent / "dashboard.html"
+# A PyInstaller build unpacks to a temp dir that's deleted on exit, so write
+# the dashboard next to the executable; template.html is bundled inside.
+OUT_DIR = (Path(sys.executable).parent if getattr(sys, "frozen", False)
+           else Path(__file__).parent)
+OUT_HTML = OUT_DIR / "dashboard.html"
 TEMPLATE = Path(__file__).parent / "template.html"
 # Permanent history: Claude Code deletes transcripts after cleanupPeriodDays
 # (default 30), so every run copies them into this DB first. Override with --db.
