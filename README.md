@@ -7,6 +7,14 @@ see what your Pro subscription usage would have cost on the API plan.
 
 No dependencies — Python 3.9+ standard library only.
 
+## Download (no Python needed)
+
+Each [release](https://github.com/goldeneye13/ClaudeUse/releases) has standalone
+builds for Windows (x64), Linux (x64) and macOS (Apple Silicon). They take the
+same options as the script below and write `dashboard.html` next to themselves.
+They're unsigned, so expect a first-run warning: on Windows click **More info →
+Run anyway**; on macOS run `xattr -d com.apple.quarantine ClaudeUse` once.
+
 ## Usage
 
 ```powershell
