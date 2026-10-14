@@ -11,6 +11,7 @@ Usage:
     python usage_dashboard.py --no-open  # just generate
     python usage_dashboard.py --serve    # serve on http://localhost:8377 (regenerates per request)
     python usage_dashboard.py --import-only  # just update the history DB
+    claude-use --install                 # (release exe) install into ~/.local/bin
 
 No dependencies beyond the standard library.
 """
@@ -20,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -28,6 +30,9 @@ import webbrowser
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Bump in the release PR; the release build fails unless the tag is v<this>.
+__version__ = "2.0.0"
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 # template.html is bundled inside a PyInstaller build, so this works frozen too.
@@ -43,6 +48,7 @@ def _xdg(var: str, default: str) -> Path:
     return root / APP
 
 
+BIN_DIR = Path.home() / ".local" / "bin"  # no XDG variable for this one
 CONFIG_FILE = _xdg("XDG_CONFIG_HOME", ".config") / "config.toml"
 # Permanent history: Claude Code deletes transcripts after cleanupPeriodDays
 # (default 30), so every run copies them into this DB first. Override with --db.
@@ -239,6 +245,97 @@ def snapshot(live: Path, owned: Path) -> None:
     os.replace(tmp, owned)                         # atomic: Drive never sees half a file
 
 
+# Installer (single exe): copy into BIN_DIR, create the XDG folders, write a
+# default config only if none exists. Never touches data or the dashboard.
+
+CONFIG_TEMPLATE = """\
+# claude-use settings. --install writes this once and never overwrites it;
+# only `claude-use --install --data-dir PATH` changes data_dir later.
+
+# Owned data: after every import a snapshot of the history DB goes to this
+# folder, so it survives losing the laptop. It must exist.
+{data_dir_line}
+"""
+
+
+def _toml_path(p: Path) -> str:
+    # forward slashes: no TOML escaping needed, and Windows accepts them
+    return json.dumps(p.as_posix())
+
+
+def ask_data_dir() -> Path | None:
+    """First-install prompt. Blank means no backup, unless a default is proposed."""
+    base = os.environ.get("OWNED_DATA_HOME", "")
+    proposal = Path(base) / APP if base and Path(base).is_absolute() else None
+    prompt = f"Backup folder [{proposal}]: " if proposal else "Backup folder (blank for none): "
+    try:
+        answer = input(prompt).strip().strip('"')
+    except EOFError:  # not interactive: take the default
+        answer = ""
+    return Path(answer).expanduser().absolute() if answer else proposal
+
+
+def set_data_dir(data_dir: Path) -> None:
+    """Point data_dir in an existing config at data_dir; leave the rest alone."""
+    text = CONFIG_FILE.read_text(encoding="utf-8")
+    line = f"data_dir = {_toml_path(data_dir)}"
+    text, n = re.subn(r"(?m)^data_dir\s*=.*$", lambda _: line, text, count=1)
+    if not n:
+        text = text.rstrip("\n") + f"\n{line}\n"
+    tomllib.loads(text)  # never write a config the app can't read
+    CONFIG_FILE.write_text(text, encoding="utf-8")
+
+
+def install(data_dir: Path | None) -> None:
+    if not getattr(sys, "frozen", False):
+        sys.exit("--install runs from the release executable."
+                 " From source, run usage_dashboard.py directly.")
+    exe = Path(sys.executable)
+    target = BIN_DIR / ("claude-use.exe" if os.name == "nt" else "claude-use")
+    if exe.resolve() == target.resolve():
+        print(f"Already installed: {target}")
+    else:
+        BIN_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(exe, target)
+        except PermissionError:
+            sys.exit(f"Can't replace {target}: close the running claude-use"
+                     " (and any scheduled run), then install again.")
+        print(f"Installed {target}")
+
+    for d in (CONFIG_FILE.parent, DEFAULT_DB.parent, OUT_HTML.parent):
+        if not d.exists():
+            d.mkdir(parents=True)
+            print(f"Created {d}")
+
+    if CONFIG_FILE.exists():
+        if data_dir:
+            data_dir.mkdir(parents=True, exist_ok=True)
+            set_data_dir(data_dir)
+            print(f"Set data_dir = {data_dir} in {CONFIG_FILE}")
+        else:
+            print(f"Kept {CONFIG_FILE}")
+    else:
+        data_dir = data_dir or ask_data_dir()
+        if data_dir:
+            data_dir.mkdir(parents=True, exist_ok=True)
+            line = f"data_dir = {_toml_path(data_dir)}"
+        else:
+            line = '# data_dir = "/path/to/synced/folder/claude-use"'
+        CONFIG_FILE.write_text(CONFIG_TEMPLATE.format(data_dir_line=line), encoding="utf-8")
+        print(f"Wrote {CONFIG_FILE}")
+        if not data_dir:
+            print(f"No backup: history lives only in {DEFAULT_DB}.\n"
+                  f"To back it up later: claude-use --install --data-dir PATH")
+    if data_dir:
+        print(f"Backup snapshot: {data_dir / DB_NAME} (written after each import)")
+
+    on_path = any(Path(p).resolve() == BIN_DIR.resolve()
+                  for p in os.environ.get("PATH", "").split(os.pathsep) if p)
+    if not on_path:
+        print(f"Note: {BIN_DIR} is not on PATH; add it to run claude-use by name.")
+
+
 def aggregate(db: Path) -> dict:
     """Aggregate every stored message per (day, model, project) and price it."""
     conn = open_db(db)
@@ -337,7 +434,8 @@ def print_summary(data: dict) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-open", action="store_true", help="don't open the browser")
     ap.add_argument("--serve", action="store_true", help="serve instead of writing a file")
     ap.add_argument("--port", type=int, default=8377)
@@ -346,7 +444,18 @@ def main() -> None:
                          " (no snapshot to data_dir)")
     ap.add_argument("--import-only", action="store_true",
                     help="copy new transcript data into the DB and exit (for a scheduled task)")
+    ap.add_argument("--install", action="store_true",
+                    help=f"copy this executable to {BIN_DIR} and set up its folders")
+    ap.add_argument("--data-dir", type=Path, metavar="PATH",
+                    help="with --install: back up the history DB to this folder")
+    ap.add_argument("--version", action="version", version=f"claude-use {__version__}")
     args = ap.parse_args()
+
+    if args.data_dir and not args.install:
+        ap.error("--data-dir only works with --install")
+    if args.install:
+        install(args.data_dir.expanduser().absolute() if args.data_dir else None)
+        return
 
     # --db is for one-off use, so only the default DB is seeded and snapshotted
     owned = None

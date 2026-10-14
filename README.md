@@ -7,13 +7,31 @@ see what your Pro subscription usage would have cost on the API plan.
 
 No dependencies — Python 3.11+ standard library only.
 
-## Download (no Python needed)
+## Install (no Python needed)
 
-Each [release](https://github.com/goldeneye13/ClaudeUse/releases) has standalone
-builds for Windows (x64), Linux (x64) and macOS (Apple Silicon). They take the
-same options as the script below.
+Each [release](https://github.com/goldeneye13/ClaudeUse/releases) has a standalone
+`claude-use` build for Windows (x64), Linux (x64) and macOS (Apple Silicon).
 They're unsigned, so expect a first-run warning: on Windows click **More info →
-Run anyway**; on macOS run `xattr -d com.apple.quarantine ClaudeUse` once.
+Run anyway**; on macOS run `xattr -d com.apple.quarantine claude-use` once.
+
+Download it, then install it from wherever it landed:
+
+```powershell
+.\claude-use-windows-x64.exe --install     # or ./claude-use --install
+claude-use --version
+```
+
+`--install` copies the executable to `~/.local/bin/` (`~` is `%USERPROFILE%` on
+Windows; put that folder on `PATH` if it isn't), creates its folders, and on the
+first install writes `~/.config/claude-use/config.toml` after asking where to keep
+a backup copy of the history (see [Backup copy](#backup-copy-optional)). A
+reinstall replaces only the executable and never asks again. On Windows, close
+any running `claude-use` (including a scheduled run) first.
+
+To upgrade, download the new release and run `--install` again. To uninstall,
+delete `~/.local/bin/claude-use(.exe)`; your history and config stay.
+
+The installed `claude-use` takes the same options as the script below.
 
 ## Usage
 
@@ -48,12 +66,19 @@ which covers everything since the first run.
 ### Backup copy (optional)
 
 The DB is the only copy of history Claude Code has already deleted, so you can
-keep a snapshot somewhere durable (e.g. a Drive-synced folder). Create the
-folder, then add to `~/.config/claude-use/config.toml`:
+keep a snapshot somewhere durable (e.g. a Drive-synced folder). The first
+`--install` asks for that folder: it proposes `$OWNED_DATA_HOME/claude-use` if that
+env var is set, and a blank answer means no backup. To set or change it later:
+
+```powershell
+claude-use --install --data-dir "D:/Drive/claude-use"
+```
+
+That writes `data_dir` to `~/.config/claude-use/config.toml` (and creates the
+folder); editing that line by hand works too:
 
 ```toml
-# Owned data: must survive losing the laptop.
-data_dir = "C:/Users/you/Files/eLibrary/IT/AppData/claude-use"
+data_dir = "D:/Drive/claude-use"
 ```
 
 Every import then writes a consistent snapshot there (`VACUUM INTO`, then an
@@ -65,7 +90,9 @@ Run it from one machine only: the last machine to finish overwrites the snapshot
 
 Only history since the first run can be kept, so it's worth raising
 `cleanupPeriodDays` as well, and running `--import-only` from Task Scheduler if
-you go weeks without opening the dashboard.
+you go weeks without opening the dashboard. Point the task at the installed
+executable, `%USERPROFILE%\.local\bin\claude-use.exe --import-only`, not at a
+checkout of this repo.
 
 `dashboard.html` is fully self-contained (data embedded, no CDN, works offline)
 and supports light/dark mode. It shows:
@@ -118,6 +145,6 @@ selected range — edit `SUBSCRIPTION_MONTHLY` / `SUBSCRIPTION_NAME` at the top 
 
 ## Files
 
-- `usage_dashboard.py` — parser, SQLite history, pricing, CLI, tiny HTTP server
+- `usage_dashboard.py` — parser, SQLite history, pricing, CLI, tiny HTTP server, installer
 - `template.html` — dashboard template (data injected at `/*__DATA__*/`)
 - `~/.cache/claude-use/dashboard.html` — generated output (safe to delete/regenerate)

@@ -24,12 +24,12 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            asset: ClaudeUse-windows-x64.exe
+            asset: claude-use-windows-x64.exe
           # oldest supported runner = oldest glibc = runs on more distros
           - os: ubuntu-22.04
-            asset: ClaudeUse-linux-x64.tar.gz
+            asset: claude-use-linux-x64.tar.gz
           - os: macos-latest
-            asset: ClaudeUse-macos-arm64.tar.gz
+            asset: claude-use-macos-arm64.tar.gz
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -49,22 +49,33 @@ jobs:
       - run: pip install pyinstaller
 
       - name: Build
-        run: pyinstaller --onefile --name ClaudeUse --add-data "template.html:." usage_dashboard.py
+        run: pyinstaller --onefile --name claude-use --add-data "template.html:." usage_dashboard.py
+
+      # a release must print its own tag, or --version is lying
+      - name: Check version
+        run: |
+          ver=$(dist/claude-use --version)
+          echo "$ver"
+          if [ -n "$TAG" ] && [ "$ver" != "claude-use ${TAG#v}" ]; then
+            echo "::error::tag $TAG but __version__ says '$ver'"; exit 1
+          fi
 
       - name: Smoke test
         run: |
           mkdir -p ~/.claude/projects
-          export XDG_CACHE_HOME="$RUNNER_TEMP/cache"
-          dist/ClaudeUse --no-open --db "$RUNNER_TEMP/smoke.sqlite"
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/config" XDG_DATA_HOME="$RUNNER_TEMP/share" XDG_CACHE_HOME="$RUNNER_TEMP/cache"
+          dist/claude-use --install --data-dir "$RUNNER_TEMP/backup" < /dev/null
+          ~/.local/bin/claude-use --no-open
           test -s "$XDG_CACHE_HOME/claude-use/dashboard.html"
+          test -s "$RUNNER_TEMP/backup/usage.sqlite"
 
       # tar keeps the executable bit, which a bare download would lose
       - name: Package
         run: |
           if [ "$RUNNER_OS" = Windows ]; then
-            mv dist/ClaudeUse.exe "${{ matrix.asset }}"
+            mv dist/claude-use.exe "${{ matrix.asset }}"
           else
-            tar -czf "${{ matrix.asset }}" -C dist ClaudeUse
+            tar -czf "${{ matrix.asset }}" -C dist claude-use
           fi
 
       - name: Upload to release
