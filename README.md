@@ -36,9 +36,6 @@ which covers everything since the first run.
 
 - Location: `~/.local/share/claude-use/usage.sqlite` (`~` is `%USERPROFILE%`
   on Windows), or under `$XDG_DATA_HOME` if set. `--db` points one run elsewhere.
-- Upgrading: if that file doesn't exist yet but the old default
-  `~/Files/eLibrary/IT/LLM Usage/claude_code_usage.sqlite` does, the first run
-  copies it over and leaves the old file in place.
 - One row per API response in table `messages`, keyed on
   `requestId:message.id`. Re-importing a message replaces its row, so runs are
   idempotent; rows for deleted transcripts are kept.

@@ -50,9 +50,6 @@ DB_NAME = "usage.sqlite"
 DEFAULT_DB = _xdg("XDG_DATA_HOME", ".local/share") / DB_NAME
 # Regenerated on every run, so it's cache.
 OUT_HTML = _xdg("XDG_CACHE_HOME", ".cache") / "dashboard.html"
-# Default DB before JMR-109; copied into DEFAULT_DB once, then left alone.
-LEGACY_DB = (Path.home() / "Files" / "eLibrary" / "IT" / "LLM Usage"
-             / "claude_code_usage.sqlite")
 
 # What you actually pay for the subscription, USD/month. Change if you're on Max.
 SUBSCRIPTION_MONTHLY = 20.00
@@ -223,15 +220,12 @@ def owned_snapshot() -> Path | None:
 
 
 def seed_db(live: Path, owned: Path | None) -> None:
-    """Fill a missing live DB from the snapshot, else from the pre-JMR-109 path."""
-    if live.exists():
+    """Fill a missing live DB from the snapshot (new or rebuilt machine)."""
+    if live.exists() or not owned or not owned.exists():
         return
-    for src in (owned, LEGACY_DB):
-        if src and src.exists():
-            live.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, live)
-            print(f"Copied history {src} -> {live}")
-            return
+    live.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(owned, live)
+    print(f"Copied history {owned} -> {live}")
 
 
 def snapshot(live: Path, owned: Path) -> None:
