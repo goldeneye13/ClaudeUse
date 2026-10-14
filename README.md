@@ -114,9 +114,18 @@ checkout of this repo.
 and supports light/dark mode. It shows:
 
 - stat tiles: estimated API cost, prorated Pro cost, API÷Pro ratio, tokens, messages
-- daily API-equivalent cost stacked by model
+- daily chart stacked by model (hourly for **Today**), showing either:
+  - **Cost**: API-equivalent cost
+  - **Tokens**: new input (light: uncached input and cache writes) and output
+    (solid) per model, so a big read with a tiny answer is visible. Cache reads
+    are left out of the bars (they're ~98% of all tokens, the same context re-read
+    every turn) but listed in the tooltip.
 - cost by model and by project (bars + detail tables)
-- date-range filter (7 / 30 / 90 days / all) that re-scopes everything
+- range filter (Today / 7 / 30 / 90 days / all) that re-scopes everything. Ranges
+  end today, not on the last day with usage, so Today is blank until you've used
+  Claude Code that day.
+- remembers the last range and Cost/Tokens choice in the browser (Today and Cost
+  the first time, or if browser storage is blocked)
 
 ## How costs are computed
 

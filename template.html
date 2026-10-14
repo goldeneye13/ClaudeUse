@@ -54,6 +54,8 @@
   .filters button[aria-pressed="true"] {
     color: var(--ink); font-weight: 600; border-color: var(--accent);
   }
+  .filters .fgroup { display: flex; gap: 6px; flex-wrap: wrap; }
+  .filters .sep { width: 1px; height: 20px; background: var(--grid); margin: 0 8px; }
 
   /* stat tiles */
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 20px; }
@@ -120,21 +122,30 @@
   <h1>Claude Code usage</h1>
   <div class="sub" id="subtitle"></div>
 
-  <div class="filters" role="group" aria-label="Date range">
+  <div class="filters">
     <span class="flabel">Range</span>
-    <button data-range="7">Last 7 days</button>
-    <button data-range="30">Last 30 days</button>
-    <button data-range="90">Last 90 days</button>
-    <button data-range="all">All data</button>
+    <div class="fgroup" role="group" aria-label="Date range">
+      <button data-range="today">Today</button>
+      <button data-range="7">Last 7 days</button>
+      <button data-range="30">Last 30 days</button>
+      <button data-range="90">Last 90 days</button>
+      <button data-range="all">All data</button>
+    </div>
+    <span class="sep" aria-hidden="true"></span>
+    <span class="flabel">Show</span>
+    <div class="fgroup" role="group" aria-label="Measure">
+      <button data-metric="cost">Cost</button>
+      <button data-metric="tokens">Tokens</button>
+    </div>
   </div>
 
   <div class="tiles" id="tiles"></div>
 
   <div class="card">
-    <h2>Daily API-equivalent cost</h2>
-    <div class="desc">What each day would have cost on the API, stacked by model</div>
-    <div id="dailyChart"></div>
-    <div class="legend" id="dailyLegend"></div>
+    <h2 id="timeTitle"></h2>
+    <div class="desc" id="timeDesc"></div>
+    <div id="timeChart"></div>
+    <div class="legend" id="timeLegend"></div>
   </div>
 
   <div class="grid2">
@@ -172,7 +183,7 @@ const DATA = /*__DATA__*/null;
 
 /* ---------- helpers ---------- */
 const $ = (s) => document.querySelector(s);
-const fmt$ = (v) => v >= 100 ? "$" + Math.round(v).toLocaleString("en-US")
+const fmt$ = (v) => v === 0 ? "$0.00" : v >= 100 ? "$" + Math.round(v).toLocaleString("en-US")
   : v >= 0.995 ? "$" + v.toFixed(2) : "$" + v.toFixed(v >= 0.01 ? 2 : 3);
 const fmtTok = (v) => v >= 1e9 ? (v / 1e9).toFixed(2) + "B"
   : v >= 1e6 ? (v / 1e6).toFixed(1) + "M"
@@ -225,6 +236,7 @@ function showTip(evt, title, rows, total) {
     const row = el("div", "row");
     const key = el("span", "key");
     key.style.background = r.color || "var(--baseline)";
+    if (r.light) key.style.opacity = INPUT_OPACITY;
     row.appendChild(key);
     row.appendChild(el("span", "v", r.value));
     row.appendChild(el("span", "n", r.name));
@@ -264,12 +276,35 @@ const colorOf = {};
 MODELS.forEach((m, i) => { colorOf[m] = `var(${SLOTS[Math.min(i, SLOTS.length - 1)]})`; });
 const shortModel = (m) => m.replace(/^claude-/, "").replace(/-\d{8}$/, "");
 
-let state = { range: "30" };
+// the day the page was generated; every range ends here, not at the last
+// day with usage, so "Today" is blank on a day with no activity
+const TODAY = DATA.today;
+// "new input" segments: the model's hue as a wash, so color still says which model
+const INPUT_OPACITY = 0.4;
+const inTok = (r) => r.ti + r.c5 + r.c1;  // uncached input + cache writes
 
+// last choice survives a refresh; storage can be blocked, so never rely on it
+const RANGES = ["today", "7", "30", "90", "all"], METRICS = ["cost", "tokens"];
+const VIEW_KEY = "claude-use.view";
+function loadView() {
+  let v = {};
+  try { v = JSON.parse(localStorage.getItem(VIEW_KEY)) || {}; } catch (e) { /* default */ }
+  return { range: RANGES.includes(v.range) ? v.range : "today",
+           metric: METRICS.includes(v.metric) ? v.metric : "cost" };
+}
+function saveView() {
+  try { localStorage.setItem(VIEW_KEY, JSON.stringify(state)); } catch (e) { /* not remembered */ }
+}
+let state = loadView();
+
+function rangeStart() {
+  if (state.range === "today") return TODAY;
+  if (state.range === "all") return MIND < TODAY ? MIND : TODAY;
+  return addDays(TODAY, -(+state.range) + 1);
+}
 function filtered() {
-  if (state.range === "all") return records;
-  const cutoff = addDays(MAXD, -(+state.range) + 1);
-  return records.filter(r => r.d >= cutoff);
+  const lo = rangeStart();
+  return records.filter(r => r.d >= lo && r.d <= TODAY);
 }
 const sum = (recs, f) => recs.reduce((a, r) => a + f(r), 0);
 function groupBy(recs, keyF) {
@@ -312,35 +347,77 @@ function renderTiles(recs) {
   mk("Assistant messages", fmtInt(msgs), null);
 }
 
-/* ---------- daily stacked bar chart ---------- */
-function renderDaily(recs) {
-  const host = $("#dailyChart");
+/* ---------- time chart: days, or hours for Today; cost or tokens ---------- */
+const pad2 = (n) => String(n).padStart(2, "0");
+function timeColumns(recs) {
+  if (state.range === "today") {
+    const cols = Array.from({ length: 24 }, (_, h) => ({
+      label: pad2(h) + ":00", title: `${dayLabel(TODAY)}, ${pad2(h)}:00–${pad2((h + 1) % 24)}:00`,
+      recs: [] }));
+    for (const r of DATA.hourly) cols[r.h].recs.push(r);
+    return cols;
+  }
+  const cols = [], at = {};
+  for (let d = rangeStart(); d <= TODAY; d = addDays(d, 1)) {
+    at[d] = cols.length;
+    cols.push({ label: dayLabel(d), title: dayLabel(d), recs: [] });
+  }
+  for (const r of recs) cols[at[r.d]].recs.push(r);
+  return cols;
+}
+
+// one column's stack, bottom to top: [{m, v, light, name}]
+function stackOf(colRecs) {
+  const by = groupBy(colRecs, r => r.m);
+  const segs = [];
+  for (const m of MODELS) {
+    const b = by[m];
+    if (!b) continue;
+    if (state.metric === "cost") {
+      if (b.cost > 0) segs.push({ m, v: b.cost, name: shortModel(m) });
+    } else {
+      const inp = b.ti + b.c5 + b.c1;
+      if (inp > 0) segs.push({ m, v: inp, light: true, name: `${shortModel(m)} new input` });
+      if (b.to > 0) segs.push({ m, v: b.to, name: `${shortModel(m)} output` });
+    }
+  }
+  return segs;
+}
+
+function renderTime(recs) {
+  const hourly = state.range === "today", tokens = state.metric === "tokens";
+  $("#timeTitle").textContent = (hourly ? "Today by hour: " : "Daily ") +
+    (tokens ? "tokens" : "API-equivalent cost");
+  $("#timeDesc").textContent = tokens
+    ? "New input (light: uncached input + cache writes) and output (solid), stacked by model." +
+      " Cache reads are left out: they are the same context re-read every turn."
+    : `What each ${hourly ? "hour" : "day"} would have cost on the API, stacked by model`;
+  const fmtV = tokens ? fmtTok : fmt$;
+
+  const host = $("#timeChart");
   host.textContent = "";
-  if (!recs.length) { host.appendChild(el("div", "desc", "No data in range.")); return; }
-
-  const dates = recs.map(r => r.d);
-  const lo = dates.reduce((a, b) => a < b ? a : b);
-  const days = [];
-  for (let d = lo; d <= MAXD; d = addDays(d, 1)) days.push(d);
-
-  const perDay = {};
-  for (const d of days) perDay[d] = {};
-  for (const r of recs) perDay[r.d][r.m] = (perDay[r.d][r.m] || 0) + r.cost;
-  const dayTotal = days.map(d => Object.values(perDay[d]).reduce((a, b) => a + b, 0));
-  const ticks = niceTicks(Math.max(...dayTotal));
+  const cols = timeColumns(recs);
+  const stacks = cols.map(c => stackOf(c.recs));
+  const totals = stacks.map(s => s.reduce((a, g) => a + g.v, 0));
+  if (!totals.some(t => t > 0)) {
+    host.appendChild(el("div", "desc", hourly ? "No usage today yet." : "No usage in this range."));
+    $("#timeLegend").textContent = "";
+    return;
+  }
+  const ticks = niceTicks(Math.max(...totals));
   const maxY = ticks[ticks.length - 1];
 
   const W = Math.max(560, host.clientWidth || 900), H = 240;
-  const M = { t: 8, r: 8, b: 26, l: 44 };
+  const M = { t: 8, r: 8, b: 26, l: 48 };
   const iw = W - M.l - M.r, ih = H - M.t - M.b;
   const y = (v) => M.t + ih - (v / maxY) * ih;
-  const band = iw / days.length;
+  const band = iw / cols.length;
   const bw = Math.min(24, Math.max(3, band - 2));
 
   const svg = svgEl("svg");
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", "Daily API-equivalent cost, stacked by model");
+  svg.setAttribute("aria-label", $("#timeTitle").textContent + ", stacked by model");
 
   for (const t of ticks) {
     const ln = svgEl("line");
@@ -354,39 +431,42 @@ function renderDaily(recs) {
       tx.setAttribute("x", M.l - 6); tx.setAttribute("y", y(t) + 4);
       tx.setAttribute("text-anchor", "end");
       tx.setAttribute("class", "tick");
-      tx.textContent = "$" + (t >= 1 ? Math.round(t) : t);
+      tx.textContent = tokens ? fmtTok(t) : "$" + (t >= 1 ? Math.round(t) : t);
       svg.appendChild(tx);
     }
   }
 
-  const every = Math.ceil(days.length / Math.floor(iw / 56));
-  days.forEach((d, i) => {
-    if (i % every !== 0 && i !== days.length - 1) return;
+  const every = Math.ceil(cols.length / Math.floor(iw / 56));
+  const last = cols.length - 1;
+  cols.forEach((c, i) => {
+    // the last column gets a label too, unless it would crowd the previous one
+    const lastFits = i === last && last % every >= every / 2;
+    if (i % every !== 0 && !lastFits) return;
     const tx = svgEl("text");
     tx.setAttribute("x", M.l + band * i + band / 2);
     tx.setAttribute("y", H - 8);
     tx.setAttribute("text-anchor", "middle");
-    tx.textContent = dayLabel(d);
+    tx.textContent = c.label;
     svg.appendChild(tx);
   });
 
-  days.forEach((d, i) => {
+  cols.forEach((c, i) => {
     const x = M.l + band * i + (band - bw) / 2;
-    const stack = MODELS.map(m => [m, perDay[d][m] || 0]).filter(s => s[1] > 0);
+    const stack = stacks[i];
     let acc = 0;
     const segEls = [];
-    stack.forEach(([m, v], si) => {
-      const y1 = y(acc + v), y0 = y(acc);
+    stack.forEach((g, si) => {
+      const y1 = y(acc + g.v), y0 = y(acc);
       const h = Math.max(0, y0 - y1 - (si < stack.length - 1 ? 2 : 0)); // 2px surface gap between segments
-      const isTop = si === stack.length - 1;
       const p = svgEl("path");
-      p.setAttribute("d", isTop ? barTopPath(x, y1, bw, h, 4)
-                                : `M${x},${y1} h${bw} v${h} h${-bw} Z`);
-      p.setAttribute("fill", colorOf[m]);
+      p.setAttribute("d", si === stack.length - 1 ? barTopPath(x, y1, bw, h, 4)
+                                                   : `M${x},${y1} h${bw} v${h} h${-bw} Z`);
+      p.setAttribute("fill", colorOf[g.m]);
+      if (g.light) p.setAttribute("fill-opacity", INPUT_OPACITY);
       p.setAttribute("class", "seg");
       svg.appendChild(p);
       segEls.push(p);
-      acc += v;
+      acc += g.v;
     });
     // full-band hit target, bigger than the marks
     const hit = svgEl("rect");
@@ -394,15 +474,18 @@ function renderDaily(recs) {
     hit.setAttribute("width", band); hit.setAttribute("height", ih);
     hit.setAttribute("class", "hit");
     hit.setAttribute("tabindex", "0");
-    const rows = stack.slice().reverse().map(([m, v]) =>
-      ({ color: colorOf[m], value: fmt$(v), name: shortModel(m) }));
-    const total = { value: fmt$(dayTotal[i]), name: "total" };
+    const rows = stack.slice().reverse().map(g =>
+      ({ color: colorOf[g.m], light: g.light, value: fmtV(g.v), name: g.name }));
+    if (tokens && stack.length) {
+      rows.push({ value: fmtTok(sum(c.recs, r => r.cr)), name: "cache reads (not charted)" });
+    }
+    const total = { value: fmtV(totals[i]), name: tokens ? "charted total" : "total" };
     const over = (e) => {
       segEls.forEach(s => s.style.filter = "brightness(1.12)");
-      showTip(e, dayLabel(d) + (dayTotal[i] === 0 ? " — no usage" : ""), rows, stack.length ? total : null);
+      showTip(e, c.title + (totals[i] === 0 ? " — no usage" : ""), rows, stack.length ? total : null);
     };
     hit.addEventListener("pointermove", over);
-    hit.addEventListener("focus", (e) => over({ clientX: innerWidth / 2, clientY: innerHeight / 3 }));
+    hit.addEventListener("focus", () => over({ clientX: innerWidth / 2, clientY: innerHeight / 3 }));
     const out = () => { segEls.forEach(s => s.style.filter = ""); hideTip(); };
     hit.addEventListener("pointerleave", out);
     hit.addEventListener("blur", out);
@@ -411,17 +494,23 @@ function renderDaily(recs) {
 
   host.appendChild(svg);
 
-  const leg = $("#dailyLegend");
+  // legend: models when there's more than one, plus the shade key in tokens mode
+  const leg = $("#timeLegend");
   leg.textContent = "";
-  if (MODELS.length > 1) {
-    for (const m of MODELS) {
-      const it = el("span", "item");
-      const sw = el("span", "sw");
-      sw.style.background = colorOf[m];
-      it.appendChild(sw);
-      it.appendChild(el("span", null, shortModel(m)));
-      leg.appendChild(it);
-    }
+  const item = (color, label, light) => {
+    const it = el("span", "item");
+    const sw = el("span", "sw");
+    sw.style.background = color;
+    if (light) sw.style.opacity = INPUT_OPACITY;
+    it.appendChild(sw);
+    it.appendChild(el("span", null, label));
+    leg.appendChild(it);
+  };
+  const shown = MODELS.filter(m => recs.some(r => r.m === m));
+  if (shown.length > 1) for (const m of shown) item(colorOf[m], shortModel(m));
+  if (tokens) {
+    item("var(--ink-2)", "output");
+    item("var(--ink-2)", "new input", true);
   }
 }
 
@@ -532,11 +621,13 @@ function renderTable(hostSel, rows, nameHead, swatchF) {
 /* ---------- main render ---------- */
 function render() {
   const recs = filtered();
-  document.querySelectorAll(".filters button").forEach(b =>
+  document.querySelectorAll("[data-range]").forEach(b =>
     b.setAttribute("aria-pressed", String(b.dataset.range === state.range)));
+  document.querySelectorAll("[data-metric]").forEach(b =>
+    b.setAttribute("aria-pressed", String(b.dataset.metric === state.metric)));
 
   renderTiles(recs);
-  renderDaily(recs);
+  renderTime(recs);
 
   const byModel = groupBy(recs, r => r.m);
   const modelItems = MODELS.filter(m => byModel[m]).map(m => ({
@@ -563,14 +654,16 @@ function render() {
 
 $("#subtitle").textContent =
   `Local transcripts ${MIND} → ${MAXD} · generated ${DATA.generated} · ` +
-  `API pricing incl. cache writes (5m ×1.25, 1h ×2) and cache reads (×0.1)`;
+  `API pricing incl. cache writes (5m ×1.25, 1h ×2) and cache reads (×0.1; ×0.025 on Fable/Mythos 5.1)`;
 $("#foot").textContent =
   "Costs are estimates at standard API rates (no batch discount). Cache-read tokens dominate agentic " +
-  "usage and are billed at 10% of the input rate. Subscription comparison assumes " +
+  "usage and are billed at 10% of the input rate (2.5% on Fable/Mythos 5.1). Subscription comparison assumes " +
   `${DATA.subName} at $${DATA.subMonthly}/month, prorated over the selected span.`;
 
-document.querySelectorAll(".filters button").forEach(b =>
-  b.addEventListener("click", () => { state.range = b.dataset.range; render(); }));
+document.querySelectorAll("[data-range]").forEach(b =>
+  b.addEventListener("click", () => { state.range = b.dataset.range; saveView(); render(); }));
+document.querySelectorAll("[data-metric]").forEach(b =>
+  b.addEventListener("click", () => { state.metric = b.dataset.metric; saveView(); render(); }));
 
 let rzT;
 addEventListener("resize", () => { clearTimeout(rzT); rzT = setTimeout(render, 150); });
