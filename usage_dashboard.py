@@ -105,9 +105,8 @@ def rates_for(model: str, speed: str = "standard") -> tuple[float, float, float]
     return rin, rout, cache_r
 
 
-def local_date(ts: str) -> str:
-    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    return dt.astimezone().strftime("%Y-%m-%d")
+def local_time(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
 
 
 def short_path(p: str) -> str:
@@ -542,12 +541,10 @@ def aggregate(db: Path) -> dict:
     finally:
         conn.close()
 
-    # aggregate: (date, model, speed, project) -> sums
-    agg: dict[tuple, dict] = defaultdict(
-        lambda: {"n": 0, "ti": 0, "to": 0, "c5": 0, "c1": 0, "cr": 0, "ws": 0}
-    )
-    for ts, model, speed, proj, ti, to, c5, c1, cr, ws in msgs:
-        a = agg[(local_date(ts), model, speed, proj_names.get(proj, proj))]
+    def sums() -> dict:
+        return {"n": 0, "ti": 0, "to": 0, "c5": 0, "c1": 0, "cr": 0, "ws": 0}
+
+    def add(a: dict, ti, to, c5, c1, cr, ws) -> None:
         a["n"] += 1
         a["ti"] += ti
         a["to"] += to
@@ -556,8 +553,7 @@ def aggregate(db: Path) -> dict:
         a["cr"] += cr
         a["ws"] += ws
 
-    records = []
-    for (d, model, speed, proj), a in sorted(agg.items()):
+    def priced(model: str, speed: str, a: dict) -> dict:
         rin, rout, cache_r = rates_for(model, speed)
         cost = (
             a["ti"] * rin
@@ -567,13 +563,32 @@ def aggregate(db: Path) -> dict:
             + a["cr"] * rin * cache_r
         ) / 1e6 + a["ws"] * WEB_SEARCH_PER_1K / 1000
         label = f"{model} (fast)" if speed == "fast" else model
-        records.append({"d": d, "m": label, "p": proj, **a, "cost": round(cost, 4)})
+        return {"m": label, **a, "cost": round(cost, 4)}
+
+    now = datetime.now().astimezone()
+    today = now.strftime("%Y-%m-%d")
+    # (date, model, speed, project) -> sums; today also per hour for the Today chart
+    agg: dict[tuple, dict] = defaultdict(sums)
+    hourly: dict[tuple, dict] = defaultdict(sums)
+    for ts, model, speed, proj, *tok in msgs:
+        t = local_time(ts)
+        d = t.strftime("%Y-%m-%d")
+        add(agg[(d, model, speed, proj_names.get(proj, proj))], *tok)
+        if d == today:
+            add(hourly[(t.hour, model, speed)], *tok)
+
+    records = [{"d": d, "p": proj, **priced(model, speed, a)}
+               for (d, model, speed, proj), a in sorted(agg.items())]
+    hours = [{"h": h, **priced(model, speed, a)}
+             for (h, model, speed), a in sorted(hourly.items())]
 
     return {
-        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "generated": now.strftime("%Y-%m-%d %H:%M"),
+        "today": today,
         "subMonthly": SUBSCRIPTION_MONTHLY,
         "subName": SUBSCRIPTION_NAME,
         "records": records,
+        "hourly": hours,
     }
 
 
