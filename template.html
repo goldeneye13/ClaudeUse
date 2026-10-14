@@ -150,13 +150,13 @@
 
   <div class="grid2">
     <div class="card">
-      <h2>Cost by model</h2>
-      <div class="desc">API-equivalent cost for the selected range</div>
+      <h2 id="modelTitle"></h2>
+      <div class="desc" id="modelDesc"></div>
       <div id="modelChart"></div>
     </div>
     <div class="card">
-      <h2>Cost by project</h2>
-      <div class="desc">API-equivalent cost for the selected range</div>
+      <h2 id="projTitle"></h2>
+      <div class="desc" id="projDesc"></div>
       <div id="projChart"></div>
     </div>
   </div>
@@ -517,7 +517,8 @@ function renderTime(recs) {
 
 /* ---------- horizontal bar charts ---------- */
 function renderHBars(hostSel, items, colorF, tipTitle) {
-  // items: [{name, cost, detail}] sorted desc
+  // items: [{name, segs: [{v, light}], total, detail}] sorted desc; segs left to right
+  const fmtV = state.metric === "tokens" ? fmtTok : fmt$;
   const host = $(hostSel);
   host.textContent = "";
   if (!items.length) { host.appendChild(el("div", "desc", "No data in range.")); return; }
@@ -526,7 +527,7 @@ function renderHBars(hostSel, items, colorF, tipTitle) {
   const M = { t: 4, r: 56, b: 6, l: labelW };
   const H = M.t + items.length * rowH + M.b;
   const iw = W - M.l - M.r;
-  const maxV = Math.max(...items.map(i => i.cost), 1e-9);
+  const maxV = Math.max(...items.map(i => i.total), 1e-9);
 
   const svg = svgEl("svg");
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
@@ -548,17 +549,29 @@ function renderHBars(hostSel, items, colorF, tipTitle) {
     name.textContent = it.name.length > 26 ? "…" + it.name.slice(-25) : it.name;
     svg.appendChild(name);
 
-    const w = Math.max(2, (it.cost / maxV) * iw);
-    const p = svgEl("path");
-    p.setAttribute("d", barRightPath(M.l, yc - bh / 2, w, bh, 4));
-    p.setAttribute("fill", colorF(it));
-    p.setAttribute("class", "hbar");
-    svg.appendChild(p);
+    const w = Math.max(2, (it.total / maxV) * iw);
+    const segs = it.segs.filter(s => s.v > 0);
+    const parts = [];
+    let x = M.l;
+    segs.forEach((s, si) => {
+      const isEnd = si === segs.length - 1;
+      // 2px surface gap between segments; the last one gets the rounded end
+      const sw = Math.max(isEnd ? 2 : 1, (s.v / it.total) * w - (isEnd ? 0 : 2));
+      const p = svgEl("path");
+      p.setAttribute("d", isEnd ? barRightPath(x, yc - bh / 2, sw, bh, 4)
+                                : `M${x},${yc - bh / 2} h${sw} v${bh} h${-sw} Z`);
+      p.setAttribute("fill", colorF(it));
+      if (s.light) p.setAttribute("fill-opacity", INPUT_OPACITY);
+      p.setAttribute("class", "hbar");
+      svg.appendChild(p);
+      parts.push(p);
+      x += sw + 2;
+    });
 
     const val = svgEl("text");
     val.setAttribute("x", M.l + w + 7); val.setAttribute("y", yc + 4);
     val.setAttribute("class", "val tick");
-    val.textContent = fmt$(it.cost);
+    val.textContent = fmtV(it.total);
     svg.appendChild(val);
 
     const hit = svgEl("rect");
@@ -566,13 +579,15 @@ function renderHBars(hostSel, items, colorF, tipTitle) {
     hit.setAttribute("width", W); hit.setAttribute("height", rowH);
     hit.setAttribute("class", "hit");
     hit.setAttribute("tabindex", "0");
+    // detail rows: [name, value, key] where key is "light", "none" or absent (solid)
     const over = (e) => {
-      p.style.filter = "brightness(1.12)";
-      showTip(e, it.name, it.detail.map(d => ({ color: colorF(it), value: d[1], name: d[0] })));
+      parts.forEach(s => s.style.filter = "brightness(1.12)");
+      showTip(e, it.name, it.detail.map(([name, value, key]) =>
+        ({ color: key === "none" ? null : colorF(it), light: key === "light", value, name })));
     };
     hit.addEventListener("pointermove", over);
     hit.addEventListener("focus", () => over({ clientX: innerWidth / 2, clientY: innerHeight / 2 }));
-    const out = () => { p.style.filter = ""; hideTip(); };
+    const out = () => { parts.forEach(s => s.style.filter = ""); hideTip(); };
     hit.addEventListener("pointerleave", out);
     hit.addEventListener("blur", out);
     svg.appendChild(hit);
@@ -630,21 +645,37 @@ function render() {
   renderTiles(recs);
   renderTime(recs);
 
+  // the Show switch scopes these too: cost, or new input + output like the time chart
+  const tokens = state.metric === "tokens";
+  const what = tokens ? "Tokens" : "Cost";
+  const desc = tokens
+    ? "New input (light) and output (solid) for the selected range; cache reads in the tooltip"
+    : "API-equivalent cost for the selected range";
+  $("#modelTitle").textContent = `${what} by model`;
+  $("#projTitle").textContent = `${what} by project`;
+  $("#modelDesc").textContent = $("#projDesc").textContent = desc;
+  const hItem = (name, b, extra) => {
+    const segs = tokens ? [{ v: b.ti + b.c5 + b.c1, light: true }, { v: b.to }] : [{ v: b.cost }];
+    return {
+      name, ...extra, segs, total: segs.reduce((a, s) => a + s.v, 0),
+      detail: tokens
+        ? [["output", fmtTok(b.to)], ["new input", fmtTok(b.ti + b.c5 + b.c1), "light"],
+           ["cache reads (not charted)", fmtTok(b.cr), "none"], ["API cost", fmt$(b.cost), "none"]]
+        : [["API cost", fmt$(b.cost)], ["messages", fmtInt(b.n)],
+           ["output tokens", fmtTok(b.to)]],
+    };
+  };
+
   const byModel = groupBy(recs, r => r.m);
-  const modelItems = MODELS.filter(m => byModel[m]).map(m => ({
-    name: shortModel(m), key: m, cost: byModel[m].cost,
-    detail: [["API cost", fmt$(byModel[m].cost)], ["messages", fmtInt(byModel[m].n)],
-             ["output tokens", fmtTok(byModel[m].to)]],
-  })).sort((a, b) => b.cost - a.cost);
-  renderHBars("#modelChart", modelItems, it => colorOf[it.key], "Cost by model");
+  const modelItems = MODELS.filter(m => byModel[m])
+    .map(m => hItem(shortModel(m), byModel[m], { key: m }))
+    .sort((a, b) => b.total - a.total);
+  renderHBars("#modelChart", modelItems, it => colorOf[it.key], `${what} by model`);
 
   const byProj = groupBy(recs, r => r.p);
-  const projItems = Object.entries(byProj).map(([p, b]) => ({
-    name: p, cost: b.cost,
-    detail: [["API cost", fmt$(b.cost)], ["messages", fmtInt(b.n)],
-             ["output tokens", fmtTok(b.to)]],
-  })).sort((a, b) => b.cost - a.cost);
-  renderHBars("#projChart", projItems, () => "var(--accent)", "Cost by project");
+  const projItems = Object.entries(byProj).map(([p, b]) => hItem(p, b))
+    .sort((a, b) => b.total - a.total);
+  renderHBars("#projChart", projItems, () => "var(--accent)", `${what} by project`);
 
   renderTable("#modelTable",
     modelItems.map(it => ({ name: it.name, b: byModel[it.key] })), "Model",

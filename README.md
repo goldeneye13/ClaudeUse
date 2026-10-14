@@ -121,7 +121,8 @@ and supports light/dark mode. It shows:
     are left out of the bars (they're ~98% of all tokens, the same context re-read
     every turn) but listed in the tooltip. Cache writes include context rebuilt
     after a cold cache, so a tall light segment can also mean a cache refire.
-- cost by model and by project (bars + detail tables)
+- by model and by project: bars that follow the Cost/Tokens switch, plus detail
+  tables with every token type and cost
 - range filter (Today / 7 / 30 / 90 days / all) that re-scopes everything. Ranges
   end today, not on the last day with usage, so Today is blank until you've used
   Claude Code that day.
