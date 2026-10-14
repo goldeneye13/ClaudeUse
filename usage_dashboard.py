@@ -12,6 +12,7 @@ Usage:
     python usage_dashboard.py --serve    # serve on http://localhost:8377 (regenerates per request)
     python usage_dashboard.py --import-only  # just update the history DB
     claude-use --install                 # (release exe) install into ~/.local/bin
+    claude-use --uninstall               # remove it again; keeps history and settings
 
 No dependencies beyond the standard library.
 """
@@ -42,13 +43,17 @@ TEMPLATE = Path(__file__).parent / "template.html"
 APP = "claude-use"
 
 
-def _xdg(var: str, default: str) -> Path:
+def _xdg_base(var: str, default: str) -> Path:
     base = os.environ.get(var, "")
-    root = Path(base) if base and Path(base).is_absolute() else Path.home() / default
-    return root / APP
+    return Path(base) if base and Path(base).is_absolute() else Path.home() / default
+
+
+def _xdg(var: str, default: str) -> Path:
+    return _xdg_base(var, default) / APP
 
 
 BIN_DIR = Path.home() / ".local" / "bin"  # no XDG variable for this one
+INSTALLED_EXE = BIN_DIR / ("claude-use.exe" if os.name == "nt" else "claude-use")
 CONFIG_FILE = _xdg("XDG_CONFIG_HOME", ".config") / "config.toml"
 # Permanent history: Claude Code deletes transcripts after cleanupPeriodDays
 # (default 30), so every run copies them into this DB first. Override with --db.
@@ -286,12 +291,182 @@ def set_data_dir(data_dir: Path) -> None:
     CONFIG_FILE.write_text(text, encoding="utf-8")
 
 
+# Entry points: a launcher plus, on Windows, an entry in Settings > Installed
+# apps. All found by fixed name, so --uninstall never has to guess.
+
+DISPLAY_NAME = "Claude Use"
+UNINSTALL_KEY = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP}"
+
+
+def _start_menu_lnk() -> Path:
+    return (Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu"
+            / "Programs" / f"{DISPLAY_NAME}.lnk")
+
+
+def _desktop_file() -> Path:
+    return _xdg_base("XDG_DATA_HOME", ".local/share") / "applications" / f"{APP}.desktop"
+
+
+def _running_installed() -> bool:
+    return (getattr(sys, "frozen", False)
+            and Path(sys.executable).resolve() == INSTALLED_EXE.resolve())
+
+
+def create_entry_points() -> None:
+    if sys.platform == "win32":
+        import subprocess
+        import winreg
+
+        lnk = _start_menu_lnk()
+        # paths go in through env vars, so no PowerShell quoting to get wrong;
+        # WindowStyle 7 = minimized: the console only flashes in the taskbar
+        script = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:CU_LNK);"
+                  " $s.TargetPath = $env:CU_EXE; $s.WindowStyle = 7;"
+                  " $s.Description = 'Claude Code usage dashboard'; $s.Save()")
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                       env={**os.environ, "CU_LNK": str(lnk), "CU_EXE": str(INSTALLED_EXE)},
+                       check=True)
+        print(f"Created {lnk}")
+
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY) as k:
+            for name, value in (
+                ("DisplayName", DISPLAY_NAME),
+                ("DisplayVersion", __version__),
+                ("DisplayIcon", str(INSTALLED_EXE)),
+                ("InstallLocation", str(BIN_DIR)),
+                # --pause: Settings opens a console that would close before
+                # the left-behind list can be read
+                ("UninstallString", f'"{INSTALLED_EXE}" --uninstall --pause'),
+            ):
+                winreg.SetValueEx(k, name, 0, winreg.REG_SZ, value)
+            for name, value in (("NoModify", 1), ("NoRepair", 1),
+                                ("EstimatedSize", INSTALLED_EXE.stat().st_size // 1024)):
+                winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, value)
+        print(rf"Registered HKCU\{UNINSTALL_KEY} (Settings > Installed apps)")
+    elif sys.platform.startswith("linux"):
+        desktop = _desktop_file()
+        desktop.parent.mkdir(parents=True, exist_ok=True)
+        desktop.write_text(
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            f"Name={DISPLAY_NAME}\n"
+            "Comment=Claude Code usage dashboard\n"
+            f'Exec="{INSTALLED_EXE}"\n'
+            "Terminal=false\n"
+            "Categories=Utility;Development;\n"
+            "Actions=uninstall;\n"
+            "\n"
+            "[Desktop Action uninstall]\n"
+            "Name=Uninstall\n"
+            f'Exec="{INSTALLED_EXE}" --uninstall\n',
+            encoding="utf-8")
+        print(f"Created {desktop}")
+    # macOS: no launcher without an .app bundle; run it from the terminal
+
+
+def remove_entry_points() -> None:
+    if sys.platform == "win32":
+        import winreg
+
+        lnk = _start_menu_lnk()
+        if lnk.exists():
+            lnk.unlink()
+            print(f"Removed {lnk}")
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
+            print(rf"Removed HKCU\{UNINSTALL_KEY}")
+        except FileNotFoundError:
+            pass
+    elif sys.platform.startswith("linux"):
+        desktop = _desktop_file()
+        if desktop.exists():
+            desktop.unlink()
+            print(f"Removed {desktop}")
+
+
+def remove_installed_exe() -> None:
+    if not INSTALLED_EXE.exists():
+        return
+    if sys.platform == "win32" and _running_installed():
+        import subprocess
+
+        # Windows won't delete a running exe, so a detached cmd retries for
+        # ~30s until this process has exited. No rename first: PyInstaller's
+        # launcher aborts if its exe moves while running. One string, not a
+        # list: list quoting turns the inner quotes into \", which cmd misreads.
+        exe = INSTALLED_EXE
+        subprocess.Popen(f'cmd /c for /l %i in (1,1,30) do @(ping -n 2 127.0.0.1 >nul'
+                         f' & del /f /q "{exe}" 2>nul & if not exist "{exe}" exit)',
+                         close_fds=True,
+                         creationflags=subprocess.DETACHED_PROCESS
+                         | subprocess.CREATE_NO_WINDOW)
+        print(f"Removed {exe} (deleted a few seconds after this exits)")
+    else:
+        INSTALLED_EXE.unlink()
+        print(f"Removed {INSTALLED_EXE}")
+
+
+def warn_scheduled_tasks() -> None:
+    """List scheduled jobs that mention the app. Never delete them: I made them."""
+    import subprocess
+
+    hits = []
+    if sys.platform == "win32":
+        import csv
+        out = subprocess.run(["schtasks", "/query", "/fo", "csv", "/v"],
+                             capture_output=True, text=True).stdout
+        rows = list(csv.reader(out.splitlines()))
+        if rows:
+            header = rows[0]
+            col = header.index("TaskName") if "TaskName" in header else 1
+            hits = [r[col] for r in rows[1:] if r != header and len(r) > col
+                    and APP in " ".join(r).lower()]
+    else:
+        try:
+            out = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+        except OSError:  # no cron installed
+            out = ""
+        hits = [f"crontab: {line}" for line in out.splitlines()
+                if APP in line and not line.lstrip().startswith("#")]
+        for d in (Path.home() / ".config" / "systemd" / "user",
+                  Path.home() / "Library" / "LaunchAgents"):
+            if d.is_dir():
+                hits += [str(f) for f in d.iterdir()
+                         if f.is_file() and APP in f.read_text(errors="ignore")]
+    if hits:
+        print("\nScheduled jobs still pointing at claude-use (remove them yourself):")
+        for h in dict.fromkeys(hits):
+            print(f"  {h}")
+
+
+def uninstall() -> None:
+    remove_entry_points()
+    if OUT_HTML.parent.exists():
+        shutil.rmtree(OUT_HTML.parent)
+        print(f"Removed {OUT_HTML.parent}")
+    remove_installed_exe()
+    warn_scheduled_tasks()
+
+    left = [d for d in (CONFIG_FILE.parent, DEFAULT_DB.parent) if d.exists()]
+    try:
+        data_dir = tomllib.loads(CONFIG_FILE.read_text(encoding="utf-8")).get("data_dir")
+    except (OSError, tomllib.TOMLDecodeError):
+        data_dir = None
+    if data_dir and Path(data_dir).exists():
+        left.append(Path(data_dir))
+    if left:
+        print("\nLeft behind (delete by hand if you're done with them):")
+        labels = {CONFIG_FILE.parent: "settings", DEFAULT_DB.parent: "history DB"}
+        for d in left:
+            print(f"  {d}  ({labels.get(d, 'backup snapshot')})")
+
+
 def install(data_dir: Path | None) -> None:
     if not getattr(sys, "frozen", False):
         sys.exit("--install runs from the release executable."
                  " From source, run usage_dashboard.py directly.")
     exe = Path(sys.executable)
-    target = BIN_DIR / ("claude-use.exe" if os.name == "nt" else "claude-use")
+    target = INSTALLED_EXE
     if exe.resolve() == target.resolve():
         print(f"Already installed: {target}")
     else:
@@ -302,6 +477,8 @@ def install(data_dir: Path | None) -> None:
             sys.exit(f"Can't replace {target}: close the running claude-use"
                      " (and any scheduled run), then install again.")
         print(f"Installed {target}")
+
+    create_entry_points()
 
     for d in (CONFIG_FILE.parent, DEFAULT_DB.parent, OUT_HTML.parent):
         if not d.exists():
@@ -448,6 +625,10 @@ def main() -> None:
                     help=f"copy this executable to {BIN_DIR} and set up its folders")
     ap.add_argument("--data-dir", type=Path, metavar="PATH",
                     help="with --install: back up the history DB to this folder")
+    ap.add_argument("--uninstall", action="store_true",
+                    help="remove the installed executable and its shortcuts;"
+                         " keeps settings, history and backup")
+    ap.add_argument("--pause", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--version", action="version", version=f"claude-use {__version__}")
     args = ap.parse_args()
 
@@ -455,6 +636,14 @@ def main() -> None:
         ap.error("--data-dir only works with --install")
     if args.install:
         install(args.data_dir.expanduser().absolute() if args.data_dir else None)
+        return
+    if args.uninstall:
+        uninstall()
+        if args.pause:  # run from Settings > Installed apps
+            try:
+                input("\nPress Enter to close.")
+            except EOFError:
+                pass
         return
 
     # --db is for one-off use, so only the default DB is seeded and snapshotted

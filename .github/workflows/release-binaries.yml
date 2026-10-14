@@ -60,14 +60,48 @@ jobs:
             echo "::error::tag $TAG but __version__ says '$ver'"; exit 1
           fi
 
-      - name: Smoke test
+      - name: Smoke test install
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/config
+          XDG_DATA_HOME: ${{ runner.temp }}/share
+          XDG_CACHE_HOME: ${{ runner.temp }}/cache
         run: |
           mkdir -p ~/.claude/projects
-          export XDG_CONFIG_HOME="$RUNNER_TEMP/config" XDG_DATA_HOME="$RUNNER_TEMP/share" XDG_CACHE_HOME="$RUNNER_TEMP/cache"
           dist/claude-use --install --data-dir "$RUNNER_TEMP/backup" < /dev/null
           ~/.local/bin/claude-use --no-open
           test -s "$XDG_CACHE_HOME/claude-use/dashboard.html"
           test -s "$RUNNER_TEMP/backup/usage.sqlite"
+          case "$RUNNER_OS" in
+            Windows)
+              test -f "$APPDATA/Microsoft/Windows/Start Menu/Programs/Claude Use.lnk"
+              reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\claude-use' ;;
+            Linux)
+              cat "$XDG_DATA_HOME/applications/claude-use.desktop" ;;
+          esac
+
+      # uninstall from the installed copy itself: on Windows that's the
+      # delete-after-exit path
+      - name: Smoke test uninstall
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/config
+          XDG_DATA_HOME: ${{ runner.temp }}/share
+          XDG_CACHE_HOME: ${{ runner.temp }}/cache
+        run: |
+          ~/.local/bin/claude-use --uninstall
+          for i in $(seq 15); do [ -e ~/.local/bin/claude-use* ] || break; sleep 1; done
+          if ls ~/.local/bin/claude-use* 2>/dev/null; then exit 1; fi
+          test ! -e "$XDG_CACHE_HOME/claude-use"
+          # kept: settings, history, backup
+          test -s "$XDG_CONFIG_HOME/claude-use/config.toml"
+          test -s "$XDG_DATA_HOME/claude-use/usage.sqlite"
+          test -s "$RUNNER_TEMP/backup/usage.sqlite"
+          case "$RUNNER_OS" in
+            Windows)
+              test ! -e "$APPDATA/Microsoft/Windows/Start Menu/Programs/Claude Use.lnk"
+              if reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\claude-use'; then exit 1; fi ;;
+            Linux)
+              test ! -e "$XDG_DATA_HOME/applications/claude-use.desktop" ;;
+          esac
 
       # tar keeps the executable bit, which a bare download would lose
       - name: Package

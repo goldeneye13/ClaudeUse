@@ -25,11 +25,27 @@ claude-use --version
 Windows; put that folder on `PATH` if it isn't), creates its folders, and on the
 first install writes `~/.config/claude-use/config.toml` after asking where to keep
 a backup copy of the history (see [Backup copy](#backup-copy-optional)). A
-reinstall replaces only the executable and never asks again. On Windows, close
-any running `claude-use` (including a scheduled run) first.
+reinstall replaces only the executable and its shortcuts, and never asks again.
+On Windows, close any running `claude-use` (including a scheduled run) first.
 
-To upgrade, download the new release and run `--install` again. To uninstall,
-delete `~/.local/bin/claude-use(.exe)`; your history and config stay.
+It also adds a way to launch it, which refreshes the history and opens the
+dashboard:
+
+- **Windows:** a Start Menu entry, **Claude Use** (pin it to the taskbar from
+  there), and an entry in **Settings > Installed apps** whose Uninstall button
+  works.
+- **Linux:** `~/.local/share/applications/claude-use.desktop`, so it shows in your
+  app menu, with an Uninstall action on right-click.
+- **macOS:** none; run `claude-use` from a terminal.
+
+To upgrade, download the new release and run `--install` again.
+
+To uninstall, run `claude-use --uninstall` (or use Installed apps on Windows). It
+removes the executable, the shortcuts and `~/.cache/claude-use`, and prints what
+it leaves behind for you to delete by hand if you're done with them: your settings
+(`~/.config/claude-use`), the history DB (`~/.local/share/claude-use`) and the
+backup copy. It warns about any scheduled task that still runs `claude-use`, but
+doesn't remove it.
 
 The installed `claude-use` takes the same options as the script below.
 
