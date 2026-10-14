@@ -119,7 +119,8 @@ and supports light/dark mode. It shows:
   - **Tokens**: new input (light: uncached input and cache writes) and output
     (solid) per model, so a big read with a tiny answer is visible. Cache reads
     are left out of the bars (they're ~98% of all tokens, the same context re-read
-    every turn) but listed in the tooltip.
+    every turn) but listed in the tooltip. Cache writes include context rebuilt
+    after a cold cache, so a tall light segment can also mean a cache refire.
 - cost by model and by project (bars + detail tables)
 - range filter (Today / 7 / 30 / 90 days / all) that re-scopes everything. Ranges
   end today, not on the last day with usage, so Today is blank until you've used

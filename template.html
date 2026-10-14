@@ -389,7 +389,8 @@ function renderTime(recs) {
   $("#timeTitle").textContent = (hourly ? "Today by hour: " : "Daily ") +
     (tokens ? "tokens" : "API-equivalent cost");
   $("#timeDesc").textContent = tokens
-    ? "New input (light: uncached input + cache writes) and output (solid), stacked by model." +
+    ? "New input (light: uncached input + cache writes, which includes context rebuilt" +
+      " after a cold cache) and output (solid), stacked by model." +
       " Cache reads are left out: they are the same context re-read every turn."
     : `What each ${hourly ? "hour" : "day"} would have cost on the API, stacked by model`;
   const fmtV = tokens ? fmtTok : fmt$;
