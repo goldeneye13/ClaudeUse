@@ -390,17 +390,26 @@ def remove_installed_exe() -> None:
     if sys.platform == "win32" and _running_installed():
         import subprocess
 
-        # Windows won't delete a running exe, so a detached cmd retries for
-        # ~30s until this process has exited. No rename first: PyInstaller's
-        # launcher aborts if its exe moves while running. One string, not a
-        # list: list quoting turns the inner quotes into \", which cmd misreads.
-        exe = INSTALLED_EXE
-        subprocess.Popen(f'cmd /c for /l %i in (1,1,30) do @(ping -n 2 127.0.0.1 >nul'
-                         f' & del /f /q "{exe}" 2>nul & if not exist "{exe}" exit)',
-                         close_fds=True,
-                         creationflags=subprocess.DETACHED_PROCESS
-                         | subprocess.CREATE_NO_WINDOW)
-        print(f"Removed {exe} (deleted a few seconds after this exits)")
+        # Windows won't delete a running exe, so a hidden PowerShell waits for
+        # this process and PyInstaller's launcher (our parent) to exit, however
+        # long --pause keeps them open, then deletes it. No rename first:
+        # the launcher aborts if its exe moves while running. CREATE_NO_WINDOW
+        # alone, not DETACHED_PROCESS: a detached parent makes Windows open a
+        # visible console for every console program it starts.
+        script = ("Wait-Process -Id ($env:CU_PIDS -split ',') -ErrorAction SilentlyContinue;"
+                  " foreach ($i in 1..20) {"
+                  " Remove-Item -LiteralPath $env:CU_EXE -Force -ErrorAction SilentlyContinue;"
+                  " if (-not (Test-Path -LiteralPath $env:CU_EXE)) { break };"
+                  " Start-Sleep -Milliseconds 500 }")
+        pids = [os.getpid()]
+        # one-file build: the parent is the launcher, unpacked to a temp dir
+        if Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) != Path(sys.executable).parent:
+            pids.append(os.getppid())
+        subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                         env={**os.environ, "CU_EXE": str(INSTALLED_EXE),
+                              "CU_PIDS": ",".join(map(str, pids))},
+                         close_fds=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        print(f"Removed {INSTALLED_EXE} (deleted once this window closes)")
     else:
         INSTALLED_EXE.unlink()
         print(f"Removed {INSTALLED_EXE}")
