@@ -54,8 +54,9 @@ jobs:
       - name: Smoke test
         run: |
           mkdir -p ~/.claude/projects
+          export XDG_CACHE_HOME="$RUNNER_TEMP/cache"
           dist/ClaudeUse --no-open --db "$RUNNER_TEMP/smoke.sqlite"
-          test -s dist/dashboard.html
+          test -s "$XDG_CACHE_HOME/claude-use/dashboard.html"
 
       # tar keeps the executable bit, which a bare download would lose
       - name: Package
