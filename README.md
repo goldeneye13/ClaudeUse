@@ -5,13 +5,13 @@ keeps a permanent copy of the usage in a SQLite history, aggregates token usage
 per **model**, **project** and **day**, and prices it at **API rates** so you can
 see what your Pro subscription usage would have cost on the API plan.
 
-No dependencies — Python 3.9+ standard library only.
+No dependencies — Python 3.11+ standard library only.
 
 ## Download (no Python needed)
 
 Each [release](https://github.com/goldeneye13/ClaudeUse/releases) has standalone
 builds for Windows (x64), Linux (x64) and macOS (Apple Silicon). They take the
-same options as the script below and write `dashboard.html` next to themselves.
+same options as the script below.
 They're unsigned, so expect a first-run warning: on Windows click **More info →
 Run anyway**; on macOS run `xattr -d com.apple.quarantine ClaudeUse` once.
 
@@ -22,8 +22,10 @@ python usage_dashboard.py              # print summary, write dashboard.html, op
 python usage_dashboard.py --no-open    # just generate dashboard.html
 python usage_dashboard.py --serve      # live server on http://localhost:8377 (re-parses on refresh)
 python usage_dashboard.py --import-only  # just update the history DB (for a scheduled task)
-python usage_dashboard.py --db PATH    # use a different history DB
+python usage_dashboard.py --db PATH    # use a different history DB, one-off
 ```
+
+`dashboard.html` is written to `~/.cache/claude-use/` and opened from there.
 
 ## Usage history
 
@@ -32,8 +34,8 @@ in `~/.claude/settings.json`. So every run first copies what the transcripts
 hold into a SQLite database, and the dashboard is built from the database,
 which covers everything since the first run.
 
-- Default location: `~\Files\eLibrary\IT\LLM Usage\claude_code_usage.sqlite`
-  (Drive-synced). Other tools' usage would get their own file next to it.
+- Location: `~/.local/share/claude-use/usage.sqlite` (`~` is `%USERPROFILE%`
+  on Windows), or under `$XDG_DATA_HOME` if set. `--db` points one run elsewhere.
 - One row per API response in table `messages`, keyed on
   `requestId:message.id`. Re-importing a message replaces its row, so runs are
   idempotent; rows for deleted transcripts are kept.
@@ -42,6 +44,24 @@ which covers everything since the first run.
 - It's a plain SQLite file: open it with [DB Browser for SQLite](https://sqlitebrowser.org/),
   DBeaver, the `sqlite3` CLI, or Python. Close other tools before running the
   dashboard, and don't open it from two machines at once.
+
+### Backup copy (optional)
+
+The DB is the only copy of history Claude Code has already deleted, so you can
+keep a snapshot somewhere durable (e.g. a Drive-synced folder). Create the
+folder, then add to `~/.config/claude-use/config.toml`:
+
+```toml
+# Owned data: must survive losing the laptop.
+data_dir = "C:/Users/you/Files/eLibrary/IT/AppData/claude-use"
+```
+
+Every import then writes a consistent snapshot there (`VACUUM INTO`, then an
+atomic rename), and if the live DB is ever missing (new machine) the next run
+starts from the snapshot. The live DB never sits in the synced folder, because a
+sync client can upload a SQLite file mid-write. If `data_dir` doesn't exist the
+run stops with an error instead of creating it. `--db` runs skip the snapshot.
+Run it from one machine only: the last machine to finish overwrites the snapshot.
 
 Only history since the first run can be kept, so it's worth raising
 `cleanupPeriodDays` as well, and running `--import-only` from Task Scheduler if
@@ -100,4 +120,4 @@ selected range — edit `SUBSCRIPTION_MONTHLY` / `SUBSCRIPTION_NAME` at the top 
 
 - `usage_dashboard.py` — parser, SQLite history, pricing, CLI, tiny HTTP server
 - `template.html` — dashboard template (data injected at `/*__DATA__*/`)
-- `dashboard.html` — generated output (safe to delete/regenerate)
+- `~/.cache/claude-use/dashboard.html` — generated output (safe to delete/regenerate)

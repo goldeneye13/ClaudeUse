@@ -19,24 +19,37 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sqlite3
 import sys
+import tomllib
 import webbrowser
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
-# A PyInstaller build unpacks to a temp dir that's deleted on exit, so write
-# the dashboard next to the executable; template.html is bundled inside.
-OUT_DIR = (Path(sys.executable).parent if getattr(sys, "frozen", False)
-           else Path(__file__).parent)
-OUT_HTML = OUT_DIR / "dashboard.html"
+# template.html is bundled inside a PyInstaller build, so this works frozen too.
 TEMPLATE = Path(__file__).parent / "template.html"
+
+# XDG layout on every OS, Windows included (~ is %USERPROFILE%).
+APP = "claude-use"
+
+
+def _xdg(var: str, default: str) -> Path:
+    base = os.environ.get(var, "")
+    root = Path(base) if base and Path(base).is_absolute() else Path.home() / default
+    return root / APP
+
+
+CONFIG_FILE = _xdg("XDG_CONFIG_HOME", ".config") / "config.toml"
 # Permanent history: Claude Code deletes transcripts after cleanupPeriodDays
 # (default 30), so every run copies them into this DB first. Override with --db.
-DEFAULT_DB = (Path.home() / "Files" / "eLibrary" / "IT" / "LLM Usage"
-              / "claude_code_usage.sqlite")
+DB_NAME = "usage.sqlite"
+DEFAULT_DB = _xdg("XDG_DATA_HOME", ".local/share") / DB_NAME
+# Regenerated on every run, so it's cache.
+OUT_HTML = _xdg("XDG_CACHE_HOME", ".cache") / "dashboard.html"
 
 # What you actually pay for the subscription, USD/month. Change if you're on Max.
 SUBSCRIPTION_MONTHLY = 20.00
@@ -186,6 +199,46 @@ def import_transcripts(db: Path) -> None:
     print(f"{db}: {after - before:,} new messages, {after:,} stored")
 
 
+# Owned data: the DB holds history Claude Code has already deleted, so it's
+# the only copy. The live DB stays in the data dir (Drive can upload a file
+# mid-write); a snapshot goes to `data_dir` from config.toml after each import.
+
+def owned_snapshot() -> Path | None:
+    """Snapshot path from config.toml's data_dir, or None if not configured."""
+    if not CONFIG_FILE.exists():
+        return None
+    try:
+        data_dir = tomllib.loads(CONFIG_FILE.read_text(encoding="utf-8")).get("data_dir")
+    except tomllib.TOMLDecodeError as e:
+        sys.exit(f"{CONFIG_FILE}: {e}")
+    if not data_dir:
+        return None
+    # never create it: a typo or a missing drive would split the history
+    if not Path(data_dir).is_dir():
+        sys.exit(f"{CONFIG_FILE}: data_dir {data_dir} does not exist")
+    return Path(data_dir) / DB_NAME
+
+
+def seed_db(live: Path, owned: Path | None) -> None:
+    """Fill a missing live DB from the snapshot (new or rebuilt machine)."""
+    if live.exists() or not owned or not owned.exists():
+        return
+    live.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(owned, live)
+    print(f"Copied history {owned} -> {live}")
+
+
+def snapshot(live: Path, owned: Path) -> None:
+    tmp = owned.with_suffix(".sqlite.tmp")
+    tmp.unlink(missing_ok=True)                    # VACUUM INTO refuses an existing file
+    conn = sqlite3.connect(live)
+    try:
+        conn.execute("VACUUM INTO ?", (str(tmp),))  # consistent copy, even mid-write
+    finally:
+        conn.close()
+    os.replace(tmp, owned)                         # atomic: Drive never sees half a file
+
+
 def aggregate(db: Path) -> dict:
     """Aggregate every stored message per (day, model, project) and price it."""
     conn = open_db(db)
@@ -241,9 +294,15 @@ def aggregate(db: Path) -> dict:
     }
 
 
-def collect(db: Path) -> dict:
-    """Copy new transcript data into the history DB, then aggregate all of it."""
+def update_history(db: Path, owned: Path | None) -> None:
     import_transcripts(db)
+    if owned:
+        snapshot(db, owned)
+
+
+def collect(db: Path, owned: Path | None) -> dict:
+    """Copy new transcript data into the history DB, then aggregate all of it."""
+    update_history(db, owned)
     return aggregate(db)
 
 
@@ -282,14 +341,22 @@ def main() -> None:
     ap.add_argument("--no-open", action="store_true", help="don't open the browser")
     ap.add_argument("--serve", action="store_true", help="serve instead of writing a file")
     ap.add_argument("--port", type=int, default=8377)
-    ap.add_argument("--db", type=Path, default=DEFAULT_DB,
-                    help=f"usage history database (default: {DEFAULT_DB})")
+    ap.add_argument("--db", type=Path,
+                    help=f"use this history database instead of {DEFAULT_DB}"
+                         " (no snapshot to data_dir)")
     ap.add_argument("--import-only", action="store_true",
                     help="copy new transcript data into the DB and exit (for a scheduled task)")
     args = ap.parse_args()
 
+    # --db is for one-off use, so only the default DB is seeded and snapshotted
+    owned = None
+    if args.db is None:
+        args.db = DEFAULT_DB
+        owned = owned_snapshot()
+        seed_db(args.db, owned)
+
     if args.import_only:
-        import_transcripts(args.db)
+        update_history(args.db, owned)
         return
 
     if args.serve:
@@ -302,7 +369,7 @@ def main() -> None:
                 if self.path.split("?")[0] != "/":
                     self.send_error(404)
                     return
-                body = render(collect(args.db)).encode("utf-8")
+                body = render(collect(args.db, owned)).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -317,7 +384,8 @@ def main() -> None:
             webbrowser.open(f"http://localhost:{args.port}")
         HTTPServer(("127.0.0.1", args.port), H).serve_forever()
     else:
-        data = collect(args.db)
+        data = collect(args.db, owned)
+        OUT_HTML.parent.mkdir(parents=True, exist_ok=True)
         OUT_HTML.write_text(render(data), encoding="utf-8")
         print_summary(data)
         print(f"\nWrote {OUT_HTML}")
