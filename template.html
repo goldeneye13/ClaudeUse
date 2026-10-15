@@ -417,9 +417,9 @@ function stackOf(colRecs) {
       if (b.cost > 0) segs.push({ m, v: b.cost, name: shortModel(m) });
     } else {
       const inp = b.ti + b.c5 + b.c1 - b.rw;
-      if (inp > 0) segs.push({ m, v: inp, light: true, name: `${shortModel(m)} new input` });
       if (b.rw > 0) segs.push({ m, v: b.rw, light: true, hatch: true,
                                 name: `${shortModel(m)} rebuilt (cold cache)` });
+      if (inp > 0) segs.push({ m, v: inp, light: true, name: `${shortModel(m)} new input` });
       if (b.to > 0) segs.push({ m, v: b.to, name: `${shortModel(m)} output` });
     }
   }
@@ -431,7 +431,7 @@ function renderTime(recs) {
   $("#timeTitle").textContent = (hourly ? "Today by hour: " : "Daily ") +
     (tokens ? "tokens" : "API-equivalent cost");
   $("#timeDesc").textContent = tokens
-    ? "New input (light), context rebuilt after a cold cache (striped) and output (solid)," +
+    ? "Context rebuilt after a cold cache (striped), new input (light) and output (solid)," +
       " stacked by model. Cache reads are left out: they are the same context re-read every turn."
     : `What each ${hourly ? "hour" : "day"} would have cost on the API, stacked by model`;
 
@@ -784,14 +784,14 @@ function render() {
   const tokens = state.metric === "tokens";
   const what = tokens ? "Tokens" : "Cost";
   const desc = tokens
-    ? "New input (light), rebuilt after a cold cache (striped) and output (solid); cache reads in the tooltip"
+    ? "Rebuilt after a cold cache (striped), new input (light) and output (solid); cache reads in the tooltip"
     : "API-equivalent cost for the selected range";
   $("#modelTitle").textContent = `${what} by model`;
   $("#projTitle").textContent = `${what} by project`;
   $("#modelDesc").textContent = $("#projDesc").textContent = desc;
   const hItem = (name, b, extra) => {
     const segs = tokens
-      ? [{ v: b.ti + b.c5 + b.c1 - b.rw, light: true }, { v: b.rw, light: true, hatch: true }, { v: b.to }]
+      ? [{ v: b.rw, light: true, hatch: true }, { v: b.ti + b.c5 + b.c1 - b.rw, light: true }, { v: b.to }]
       : [{ v: b.cost }];
     return {
       name, ...extra, segs, total: segs.reduce((a, s) => a + s.v, 0),

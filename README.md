@@ -116,9 +116,9 @@ and supports light/dark mode. It shows:
 - stat tiles: estimated API cost, prorated Pro cost, API÷Pro ratio, tokens, messages
 - daily chart stacked by model (hourly for **Today**), showing either:
   - **Cost**: API-equivalent cost
-  - **Tokens**: per model, new input (light: uncached input and cache writes),
-    context rebuilt after a cold cache (striped) and output (solid), so a big read
-    with a tiny answer is visible. Cache reads are left out of the bars (they're
+  - **Tokens**: per model, from the bottom: context rebuilt after a cold cache
+    (striped), new input (light: uncached input and other cache writes) and output
+    (solid), so a big read with a tiny answer is visible. Cache reads are left out of the bars (they're
     ~98% of all tokens, the same context re-read every turn) but listed in the
     tooltip.
 - **Cold-cache refires**: requests that rebuilt their whole context because the
