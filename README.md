@@ -116,11 +116,15 @@ and supports light/dark mode. It shows:
 - stat tiles: estimated API cost, prorated Pro cost, API÷Pro ratio, tokens, messages
 - daily chart stacked by model (hourly for **Today**), showing either:
   - **Cost**: API-equivalent cost
-  - **Tokens**: new input (light: uncached input and cache writes) and output
-    (solid) per model, so a big read with a tiny answer is visible. Cache reads
-    are left out of the bars (they're ~98% of all tokens, the same context re-read
-    every turn) but listed in the tooltip. Cache writes include context rebuilt
-    after a cold cache, so a tall light segment can also mean a cache refire.
+  - **Tokens**: per model, new input (light: uncached input and cache writes),
+    context rebuilt after a cold cache (striped) and output (solid), so a big read
+    with a tiny answer is visible. Cache reads are left out of the bars (they're
+    ~98% of all tokens, the same context re-read every turn) but listed in the
+    tooltip.
+- **Cold-cache refires**: requests that rebuilt their whole context because the
+  cache was gone, with their count, tokens rebuilt, extra cost (writing the
+  context instead of reading it warm), warm-cache hit rate, a per-day (or
+  per-hour) chart and a table of causes. See below.
 - by model and by project: bars that follow the Cost/Tokens switch, plus detail
   tables with every token type and cost
 - range filter (Today / 7 / 30 / 90 days / all) that re-scopes everything. Ranges
@@ -128,6 +132,32 @@ and supports light/dark mode. It shows:
   Claude Code that day.
 - remembers the last range and Cost/Tokens choice in the browser (Today and Cost
   the first time, or if browser storage is blocked)
+
+## Cold-cache refires
+
+Claude Code caches the conversation for **1 hour** after each request (it writes
+almost everything with the 1-hour TTL). Come back later than that and the next
+request has to write the whole context again, at 2× the input rate instead of
+reading it at 0.1×.
+
+A request counts as a refire when its cache writes are at least **80%** of a
+context of at least **20K** tokens (`REFIRE_WRITE_SHARE`, `REFIRE_MIN_CONTEXT`).
+Real requests split cleanly: about 97% rewrite under 10% of their context, and
+refires form a separate cluster at 80% and above.
+
+The cause comes from the previous request in the same transcript, captured when
+the transcript is imported (the history DB keeps it after Claude Code deletes
+the transcript):
+
+| Cause | Meaning |
+|---|---|
+| idle > 1h | came back after the cache expired |
+| idle 5m-1h | back within the hour, but the cache was already gone |
+| model switch | the model changed mid-session (caches are per model) |
+| compaction | the context was compacted, then rewritten |
+| session start / subagent start | the first request of a transcript |
+| other | no gap or known event |
+| unknown | imported before causes were tracked, transcript since deleted |
 
 ## How costs are computed
 
