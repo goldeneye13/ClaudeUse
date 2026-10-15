@@ -91,6 +91,14 @@ FAST_RATES = (10.0, 50.0)
 FAST_MODELS = ("opus-5", "opus-4-8")
 
 CACHE_W5, CACHE_W1 = 1.25, 2.0
+
+# Cold-cache refire: the request rewrote most of a sizeable context instead of
+# reading it from cache. Real requests split cleanly: ~97% rewrite under 10%,
+# a separate cluster rewrites 80%+ (JMR-147).
+REFIRE_MIN_CONTEXT = 20_000
+REFIRE_WRITE_SHARE = 0.8
+# Claude Code writes cache with a 1h TTL (5m writes are ~0.1% of the total)
+CACHE_TTL_S = 3600
 WEB_SEARCH_PER_1K = 10.0  # $10 per 1,000 searches. Web fetch is free.
 
 
@@ -130,11 +138,24 @@ CREATE TABLE IF NOT EXISTS messages (
     cache_1h    INTEGER NOT NULL,
     cache_read  INTEGER NOT NULL,
     web_search  INTEGER NOT NULL,
-    imported_at TEXT NOT NULL
+    imported_at TEXT NOT NULL,
+    -- v2: context for cold-cache refire causes, captured while the transcript
+    -- still exists (NULL on rows imported before v2 whose transcript is gone)
+    session_id    TEXT,
+    sidechain     INTEGER,  -- 1 = subagent transcript
+    gap_s         REAL,     -- seconds since the previous request in the same transcript
+    after_compact INTEGER,  -- 1 = a compaction happened since that previous request
+    model_changed INTEGER   -- 1 = that previous request used another model
 );
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
 """
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# added in v2; ALTERed onto v1 databases in place
+V2_COLUMNS = (("session_id", "TEXT"), ("sidechain", "INTEGER"), ("gap_s", "REAL"),
+              ("after_compact", "INTEGER"), ("model_changed", "INTEGER"))
+COLUMNS = ("key", "ts", "model", "speed", "project_dir", "cwd", "input", "output",
+           "cache_5m", "cache_1h", "cache_read", "web_search", "imported_at",
+           *(c for c, _ in V2_COLUMNS))
 
 
 def scan() -> dict[str, tuple]:
@@ -148,9 +169,20 @@ def scan() -> dict[str, tuple]:
 
     for f in CLAUDE_PROJECTS.rglob("*.jsonl"):
         # project = top-level folder (subagent transcripts nest deeper)
-        proj_dir = f.relative_to(CLAUDE_PROJECTS).parts[0]
+        parts = f.relative_to(CLAUDE_PROJECTS).parts
+        proj_dir = parts[0]
+        file_rows: dict[str, tuple] = {}
+        compacts: list[str] = []
         with f.open(encoding="utf-8", errors="replace") as fh:
             for line in fh:
+                if '"compact_boundary"' in line:
+                    try:
+                        e = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if e.get("subtype") == "compact_boundary" and e.get("timestamp"):
+                        compacts.append(e["timestamp"])
+                    continue
                 if '"type":"assistant"' not in line:
                     continue
                 try:
@@ -170,12 +202,27 @@ def scan() -> dict[str, tuple]:
                     c5, c1 = u.get("cache_creation_input_tokens", 0), 0
                 st = u.get("server_tool_use") or {}
                 key = f'{e.get("requestId", "")}:{msg.get("id") or e.get("uuid")}'
-                rows[key] = (
+                file_rows[key] = (
                     key, ts, model, u.get("speed", "standard"), proj_dir, e.get("cwd"),
                     u.get("input_tokens", 0), u.get("output_tokens", 0), c5, c1,
                     u.get("cache_read_input_tokens", 0),
                     st.get("web_search_requests", 0),  # web fetch costs nothing
+                    e.get("sessionId"),
+                    int(bool(e.get("isSidechain")) or "subagents" in parts),
                 )
+
+        # refire context: each request against the previous one in this transcript
+        prev = None
+        for r in sorted(file_rows.values(), key=lambda r: r[1]):
+            if prev is None:
+                ctx = (None, 0, 0)
+            else:
+                gap = (datetime.fromisoformat(r[1].replace("Z", "+00:00"))
+                       - datetime.fromisoformat(prev[1].replace("Z", "+00:00"))).total_seconds()
+                ctx = (gap, int(any(prev[1] < c <= r[1] for c in compacts)),
+                       int(r[2] != prev[2]))
+            rows[r[0]] = r + ctx
+            prev = r
     return rows
 
 
@@ -183,6 +230,11 @@ def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+    with conn:
+        for col, typ in V2_COLUMNS:
+            if col not in have:
+                conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {typ}")
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     return conn
 
@@ -200,8 +252,9 @@ def import_transcripts(db: Path) -> None:
         before = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         with conn:
             conn.executemany(
-                "INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (r + (now,) for r in rows.values()),
+                f"INSERT OR REPLACE INTO messages ({','.join(COLUMNS)})"
+                f" VALUES ({','.join('?' * len(COLUMNS))})",
+                (r[:12] + (now,) + r[12:] for r in rows.values()),
             )
         after = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     finally:
@@ -521,6 +574,27 @@ def install(data_dir: Path | None) -> None:
         print(f"Note: {BIN_DIR} is not on PATH; add it to run claude-use by name.")
 
 
+def refire_cause(ti, c5, c1, cr, session_id, sidechain, gap, after_compact,
+                 model_changed) -> str | None:
+    """Why a request rebuilt its cache, or None if it didn't."""
+    ctx = ti + c5 + c1 + cr
+    if ctx < REFIRE_MIN_CONTEXT or (c5 + c1) < REFIRE_WRITE_SHARE * ctx:
+        return None
+    if session_id is None:  # imported before v2, transcript since deleted
+        return "unknown"
+    if gap is None:  # first request in its transcript
+        return "subagent start" if sidechain else "session start"
+    if after_compact:
+        return "compaction"
+    if model_changed:
+        return "model switch"
+    if gap > CACHE_TTL_S:
+        return "idle > 1h"
+    if gap > 300:
+        return "idle 5m-1h"
+    return "other"
+
+
 def aggregate(db: Path) -> dict:
     """Aggregate every stored message per (day, model, project) and price it."""
     conn = open_db(db)
@@ -536,15 +610,17 @@ def aggregate(db: Path) -> dict:
         }
         msgs = conn.execute(
             "SELECT ts, model, speed, project_dir, input, output,"
-            " cache_5m, cache_1h, cache_read, web_search FROM messages"
+            " cache_5m, cache_1h, cache_read, web_search,"
+            " session_id, sidechain, gap_s, after_compact, model_changed FROM messages"
         ).fetchall()
     finally:
         conn.close()
 
     def sums() -> dict:
-        return {"n": 0, "ti": 0, "to": 0, "c5": 0, "c1": 0, "cr": 0, "ws": 0}
+        # rw: cache writes that rebuilt a cold cache (part of c5 + c1)
+        return {"n": 0, "ti": 0, "to": 0, "c5": 0, "c1": 0, "cr": 0, "ws": 0, "rw": 0}
 
-    def add(a: dict, ti, to, c5, c1, cr, ws) -> None:
+    def add(a: dict, ti, to, c5, c1, cr, ws, rw) -> None:
         a["n"] += 1
         a["ti"] += ti
         a["to"] += to
@@ -552,6 +628,7 @@ def aggregate(db: Path) -> dict:
         a["c1"] += c1
         a["cr"] += cr
         a["ws"] += ws
+        a["rw"] += rw
 
     def priced(model: str, speed: str, a: dict) -> dict:
         rin, rout, cache_r = rates_for(model, speed)
@@ -570,12 +647,23 @@ def aggregate(db: Path) -> dict:
     # (date, model, speed, project) -> sums; today also per hour for the Today chart
     agg: dict[tuple, dict] = defaultdict(sums)
     hourly: dict[tuple, dict] = defaultdict(sums)
-    for ts, model, speed, proj, *tok in msgs:
+    refires = []
+    for ts, model, speed, proj, *tok, sid, side, gap, compact, switched in msgs:
         t = local_time(ts)
         d = t.strftime("%Y-%m-%d")
-        add(agg[(d, model, speed, proj_names.get(proj, proj))], *tok)
+        ti, to, c5, c1, cr, ws = tok
+        cause = refire_cause(ti, c5, c1, cr, sid, side, gap, compact, switched)
+        rw = c5 + c1 if cause else 0
+        add(agg[(d, model, speed, proj_names.get(proj, proj))], *tok, rw)
         if d == today:
-            add(hourly[(t.hour, model, speed)], *tok)
+            add(hourly[(t.hour, model, speed)], *tok, rw)
+        if cause:
+            rin, _, cache_r = rates_for(model, speed)
+            extra = (c5 * (CACHE_W5 - cache_r) + c1 * (CACHE_W1 - cache_r)) * rin / 1e6
+            refires.append({"d": d, "h": t.hour, "m": f"{model} (fast)" if speed == "fast" else model,
+                            "p": proj_names.get(proj, proj), "cause": cause,
+                            "tok": rw, "extra": round(extra, 4),
+                            "gap": None if gap is None else round(gap)})
 
     records = [{"d": d, "p": proj, **priced(model, speed, a)}
                for (d, model, speed, proj), a in sorted(agg.items())]
@@ -589,6 +677,8 @@ def aggregate(db: Path) -> dict:
         "subName": SUBSCRIPTION_NAME,
         "records": records,
         "hourly": hours,
+        "refires": sorted(refires, key=lambda r: (r["d"], r["h"])),
+        "cacheTtlMin": CACHE_TTL_S // 60,
     }
 
 

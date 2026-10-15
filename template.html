@@ -67,6 +67,8 @@
   .tile .value { font-size: 26px; font-weight: 600; letter-spacing: -0.01em; }
   .tile .note  { color: var(--ink-2); font-size: 12px; margin-top: 2px; }
   .tile.hero .value { font-size: 48px; line-height: 1.05; }
+  .tiles.compact { margin-bottom: 12px; }
+  .tiles.compact .value { font-size: 20px; }
 
   /* cards */
   .card {
@@ -148,6 +150,14 @@
     <div class="legend" id="timeLegend"></div>
   </div>
 
+  <div class="card">
+    <h2 id="refireTitle"></h2>
+    <div class="desc" id="refireDesc"></div>
+    <div class="tiles compact" id="refireTiles"></div>
+    <div id="refireChart"></div>
+    <div class="scroll-x" id="refireTable"></div>
+  </div>
+
   <div class="grid2">
     <div class="card">
       <h2 id="modelTitle"></h2>
@@ -176,6 +186,11 @@
   <footer id="foot"></footer>
 </div>
 <div id="tip" role="status"></div>
+<svg style="position:absolute;width:0;height:0" aria-hidden="true"><defs>
+  <pattern id="hatch" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+    <rect width="2" height="5" fill="var(--surface)"/>
+  </pattern>
+</defs></svg>
 
 <script>
 "use strict";
@@ -227,6 +242,27 @@ function barRightPath(x, y, w, h, r) {
   return `M${x},${y} L${x + w - r},${y} Q${x + w},${y} ${x + w},${y + r} L${x + w},${y + h - r} Q${x + w},${y + h} ${x + w - r},${y + h} L${x},${y + h} Z`;
 }
 
+// one bar segment: solid, a wash (light) or a striped wash (hatch); returns its elements
+function drawSeg(svg, d, color, seg, cls) {
+  const els = [];
+  const p = svgEl("path");
+  p.setAttribute("d", d);
+  p.setAttribute("fill", color);
+  if (seg.light) p.setAttribute("fill-opacity", INPUT_OPACITY);
+  p.setAttribute("class", cls);
+  svg.appendChild(p);
+  els.push(p);
+  if (seg.hatch) {
+    const o = svgEl("path");
+    o.setAttribute("d", d);
+    o.setAttribute("fill", "url(#hatch)");
+    o.setAttribute("pointer-events", "none");
+    svg.appendChild(o);
+    els.push(o);
+  }
+  return els;
+}
+
 /* ---------- tooltip ---------- */
 const tip = $("#tip");
 function showTip(evt, title, rows, total) {
@@ -236,6 +272,7 @@ function showTip(evt, title, rows, total) {
     const row = el("div", "row");
     const key = el("span", "key");
     key.style.background = r.color || "var(--baseline)";
+    if (r.hatch) key.style.background = `${HATCH_CSS}, ${r.color || "var(--baseline)"}`;
     if (r.light) key.style.opacity = INPUT_OPACITY;
     row.appendChild(key);
     row.appendChild(el("span", "v", r.value));
@@ -282,6 +319,8 @@ const TODAY = DATA.today;
 // "new input" segments: the model's hue as a wash, so color still says which model
 const INPUT_OPACITY = 0.4;
 const inTok = (r) => r.ti + r.c5 + r.c1;  // uncached input + cache writes
+// CSS twin of the #hatch pattern, for legend and tooltip swatches
+const HATCH_CSS = "repeating-linear-gradient(45deg, var(--surface) 0 1.5px, transparent 1.5px 3.5px)";
 
 // last choice survives a refresh; storage can be blocked, so never rely on it
 const RANGES = ["today", "7", "30", "90", "all"], METRICS = ["cost", "tokens"];
@@ -311,9 +350,9 @@ function groupBy(recs, keyF) {
   const g = {};
   for (const r of recs) {
     const k = keyF(r);
-    const b = g[k] || (g[k] = { n: 0, ti: 0, to: 0, c5: 0, c1: 0, cr: 0, ws: 0, cost: 0 });
+    const b = g[k] || (g[k] = { n: 0, ti: 0, to: 0, c5: 0, c1: 0, cr: 0, ws: 0, rw: 0, cost: 0 });
     b.n += r.n; b.ti += r.ti; b.to += r.to; b.c5 += r.c5; b.c1 += r.c1;
-    b.cr += r.cr; b.ws += r.ws; b.cost += r.cost;
+    b.cr += r.cr; b.ws += r.ws; b.rw += r.rw; b.cost += r.cost;
   }
   return g;
 }
@@ -349,12 +388,13 @@ function renderTiles(recs) {
 
 /* ---------- time chart: days, or hours for Today; cost or tokens ---------- */
 const pad2 = (n) => String(n).padStart(2, "0");
-function timeColumns(recs) {
+// columns for the range: 24 hours for Today (from hourItems), else one per day
+function timeColumns(recs, hourItems) {
   if (state.range === "today") {
     const cols = Array.from({ length: 24 }, (_, h) => ({
       label: pad2(h) + ":00", title: `${dayLabel(TODAY)}, ${pad2(h)}:00–${pad2((h + 1) % 24)}:00`,
       recs: [] }));
-    for (const r of DATA.hourly) cols[r.h].recs.push(r);
+    for (const r of hourItems) cols[r.h].recs.push(r);
     return cols;
   }
   const cols = [], at = {};
@@ -376,7 +416,9 @@ function stackOf(colRecs) {
     if (state.metric === "cost") {
       if (b.cost > 0) segs.push({ m, v: b.cost, name: shortModel(m) });
     } else {
-      const inp = b.ti + b.c5 + b.c1;
+      const inp = b.ti + b.c5 + b.c1 - b.rw;
+      if (b.rw > 0) segs.push({ m, v: b.rw, light: true, hatch: true,
+                                name: `${shortModel(m)} rebuilt (cold cache)` });
       if (inp > 0) segs.push({ m, v: inp, light: true, name: `${shortModel(m)} new input` });
       if (b.to > 0) segs.push({ m, v: b.to, name: `${shortModel(m)} output` });
     }
@@ -389,26 +431,56 @@ function renderTime(recs) {
   $("#timeTitle").textContent = (hourly ? "Today by hour: " : "Daily ") +
     (tokens ? "tokens" : "API-equivalent cost");
   $("#timeDesc").textContent = tokens
-    ? "New input (light: uncached input + cache writes, which includes context rebuilt" +
-      " after a cold cache) and output (solid), stacked by model." +
-      " Cache reads are left out: they are the same context re-read every turn."
+    ? "Context rebuilt after a cold cache (striped), new input (light) and output (solid)," +
+      " stacked by model. Cache reads are left out: they are the same context re-read every turn."
     : `What each ${hourly ? "hour" : "day"} would have cost on the API, stacked by model`;
-  const fmtV = tokens ? fmtTok : fmt$;
 
-  const host = $("#timeChart");
+  const cols = timeColumns(recs, DATA.hourly);
+  const drawn = drawColumns($("#timeChart"), cols, cols.map(c => stackOf(c.recs)), {
+    tokens, aria: $("#timeTitle").textContent + ", stacked by model",
+    empty: hourly ? "No usage today yet." : "No usage in this range.",
+    color: (g) => colorOf[g.m],
+    extraRows: (c) => tokens
+      ? [{ value: fmtTok(sum(c.recs, r => r.cr)), name: "cache reads (not charted)" }] : [],
+    totalName: tokens ? "charted total" : "total",
+  });
+
+  // legend: models when there's more than one, plus the shade key in tokens mode
+  const leg = $("#timeLegend");
+  leg.textContent = "";
+  if (!drawn) return;
+  const item = (color, label, light, hatch) => {
+    const it = el("span", "item");
+    const sw = el("span", "sw");
+    sw.style.background = hatch ? `${HATCH_CSS}, ${color}` : color;
+    if (light) sw.style.opacity = INPUT_OPACITY;
+    it.appendChild(sw);
+    it.appendChild(el("span", null, label));
+    leg.appendChild(it);
+  };
+  const shown = MODELS.filter(m => recs.some(r => r.m === m));
+  if (shown.length > 1) for (const m of shown) item(colorOf[m], shortModel(m));
+  if (tokens) {
+    item("var(--ink-2)", "output");
+    item("var(--ink-2)", "new input", true);
+    item("var(--ink-2)", "rebuilt after a cold cache", true, true);
+  }
+}
+
+// vertical stacked columns with axes and per-column hover; false if nothing to draw.
+// stacks[i] = [{v, light, hatch, name, ...}] bottom to top
+function drawColumns(host, cols, stacks, o) {
   host.textContent = "";
-  const cols = timeColumns(recs);
-  const stacks = cols.map(c => stackOf(c.recs));
+  const fmtV = o.tokens ? fmtTok : fmt$;
   const totals = stacks.map(s => s.reduce((a, g) => a + g.v, 0));
   if (!totals.some(t => t > 0)) {
-    host.appendChild(el("div", "desc", hourly ? "No usage today yet." : "No usage in this range."));
-    $("#timeLegend").textContent = "";
-    return;
+    host.appendChild(el("div", "desc", o.empty));
+    return false;
   }
   const ticks = niceTicks(Math.max(...totals));
   const maxY = ticks[ticks.length - 1];
 
-  const W = Math.max(560, host.clientWidth || 900), H = 240;
+  const W = Math.max(560, host.clientWidth || 900), H = o.height || 240;
   const M = { t: 8, r: 8, b: 26, l: 48 };
   const iw = W - M.l - M.r, ih = H - M.t - M.b;
   const y = (v) => M.t + ih - (v / maxY) * ih;
@@ -418,7 +490,7 @@ function renderTime(recs) {
   const svg = svgEl("svg");
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", $("#timeTitle").textContent + ", stacked by model");
+  svg.setAttribute("aria-label", o.aria);
 
   for (const t of ticks) {
     const ln = svgEl("line");
@@ -432,7 +504,7 @@ function renderTime(recs) {
       tx.setAttribute("x", M.l - 6); tx.setAttribute("y", y(t) + 4);
       tx.setAttribute("text-anchor", "end");
       tx.setAttribute("class", "tick");
-      tx.textContent = tokens ? fmtTok(t) : "$" + (t >= 1 ? Math.round(t) : t);
+      tx.textContent = o.tokens ? fmtTok(t) : "$" + (t >= 1 ? Math.round(t) : t);
       svg.appendChild(tx);
     }
   }
@@ -441,7 +513,7 @@ function renderTime(recs) {
   const last = cols.length - 1;
   cols.forEach((c, i) => {
     // the last column gets a label too, unless it would crowd the previous one
-    const lastFits = i === last && last % every >= every / 2;
+    const lastFits = i === last && (last % every) * band >= 50;
     if (i % every !== 0 && !lastFits) return;
     const tx = svgEl("text");
     tx.setAttribute("x", M.l + band * i + band / 2);
@@ -459,14 +531,9 @@ function renderTime(recs) {
     stack.forEach((g, si) => {
       const y1 = y(acc + g.v), y0 = y(acc);
       const h = Math.max(0, y0 - y1 - (si < stack.length - 1 ? 2 : 0)); // 2px surface gap between segments
-      const p = svgEl("path");
-      p.setAttribute("d", si === stack.length - 1 ? barTopPath(x, y1, bw, h, 4)
-                                                   : `M${x},${y1} h${bw} v${h} h${-bw} Z`);
-      p.setAttribute("fill", colorOf[g.m]);
-      if (g.light) p.setAttribute("fill-opacity", INPUT_OPACITY);
-      p.setAttribute("class", "seg");
-      svg.appendChild(p);
-      segEls.push(p);
+      segEls.push(...drawSeg(svg, si === stack.length - 1 ? barTopPath(x, y1, bw, h, 4)
+                                                          : `M${x},${y1} h${bw} v${h} h${-bw} Z`,
+                             o.color(g), g, "seg"));
       acc += g.v;
     });
     // full-band hit target, bigger than the marks
@@ -476,14 +543,12 @@ function renderTime(recs) {
     hit.setAttribute("class", "hit");
     hit.setAttribute("tabindex", "0");
     const rows = stack.slice().reverse().map(g =>
-      ({ color: colorOf[g.m], light: g.light, value: fmtV(g.v), name: g.name }));
-    if (tokens && stack.length) {
-      rows.push({ value: fmtTok(sum(c.recs, r => r.cr)), name: "cache reads (not charted)" });
-    }
-    const total = { value: fmtV(totals[i]), name: tokens ? "charted total" : "total" };
+      ({ color: o.color(g), light: g.light, hatch: g.hatch, value: fmtV(g.v), name: g.name }));
+    if (stack.length) rows.push(...o.extraRows(c));
+    const total = { value: fmtV(totals[i]), name: o.totalName };
     const over = (e) => {
       segEls.forEach(s => s.style.filter = "brightness(1.12)");
-      showTip(e, c.title + (totals[i] === 0 ? " — no usage" : ""), rows, stack.length ? total : null);
+      showTip(e, c.title + (totals[i] === 0 ? " — none" : ""), rows, stack.length ? total : null);
     };
     hit.addEventListener("pointermove", over);
     hit.addEventListener("focus", () => over({ clientX: innerWidth / 2, clientY: innerHeight / 3 }));
@@ -494,25 +559,98 @@ function renderTime(recs) {
   });
 
   host.appendChild(svg);
+  return true;
+}
 
-  // legend: models when there's more than one, plus the shade key in tokens mode
-  const leg = $("#timeLegend");
-  leg.textContent = "";
-  const item = (color, label, light) => {
-    const it = el("span", "item");
-    const sw = el("span", "sw");
-    sw.style.background = color;
-    if (light) sw.style.opacity = INPUT_OPACITY;
-    it.appendChild(sw);
-    it.appendChild(el("span", null, label));
-    leg.appendChild(it);
+/* ---------- cold-cache refires (JMR-147) ---------- */
+const CAUSES = [  // display order and meaning
+  ["idle > 1h", `Came back after the cache expired (${DATA.cacheTtlMin} min)`],
+  ["idle 5m-1h", "Back within the hour, but the cache was already gone"],
+  ["model switch", "Model changed mid-session; caches are per model"],
+  ["compaction", "Context was compacted, then rewritten"],
+  ["session start", "First request of a session or resumed transcript"],
+  ["subagent start", "A subagent starting with its own context"],
+  ["other", "No gap or known event; cache lost for another reason"],
+  ["unknown", "Imported before causes were tracked; transcript since deleted"],
+];
+
+function renderRefires(recs) {
+  const hourly = state.range === "today", tokens = state.metric === "tokens";
+  const lo = rangeStart();
+  const evs = DATA.refires.filter(e => e.d >= lo && e.d <= TODAY);
+  const val = (e) => tokens ? e.tok : e.extra;
+
+  $("#refireTitle").textContent = "Cold-cache refires";
+  $("#refireDesc").textContent =
+    "Requests that rebuilt their whole context because the cache was gone. Claude Code keeps it " +
+    `${DATA.cacheTtlMin} minutes after the last request. ` +
+    (tokens ? "Bars: tokens rebuilt" : "Bars: extra cost against reading the same context warm") +
+    ` per ${hourly ? "hour" : "day"}.`;
+
+  // tiles
+  const box = $("#refireTiles");
+  box.textContent = "";
+  const mk = (label, value, note) => {
+    const t = el("div", "tile");
+    t.appendChild(el("div", "label", label));
+    t.appendChild(el("div", "value", value));
+    if (note) t.appendChild(el("div", "note", note));
+    box.appendChild(t);
   };
-  const shown = MODELS.filter(m => recs.some(r => r.m === m));
-  if (shown.length > 1) for (const m of shown) item(colorOf[m], shortModel(m));
-  if (tokens) {
-    item("var(--ink-2)", "output");
-    item("var(--ink-2)", "new input", true);
+  const rebuilt = sum(evs, e => e.tok), extra = sum(evs, e => e.extra);
+  const writes = sum(recs, r => r.c5 + r.c1), cost = sum(recs, r => r.cost);
+  const inSide = sum(recs, r => r.ti + r.c5 + r.c1 + r.cr), warm = sum(recs, r => r.cr);
+  const pct = (a, b) => b > 0 ? Math.round(a / b * 100) + "%" : "—";
+  mk("Refires", fmtInt(evs.length), "cache rebuilt from scratch");
+  mk("Context rebuilt", fmtTok(rebuilt), `${pct(rebuilt, writes)} of cache writes`);
+  mk("Extra cost", fmt$(extra), `${pct(extra, cost)} of API cost`);
+  mk("Warm cache hits", pct(warm, inSide), "of input read from cache");
+
+  // chart: one series; the causes are in the tooltip and the table
+  const cols = timeColumns(evs, evs.filter(e => e.d === TODAY));
+  const stacks = cols.map(c => {
+    const v = sum(c.recs, val);
+    // striped wash in neutral ink: the same "rebuilt" look as the Tokens view, no model's hue
+    return v > 0 ? [{ v, light: true, hatch: true, name: tokens ? "tokens rebuilt" : "extra cost" }] : [];
+  });
+  drawColumns($("#refireChart"), cols, stacks, {
+    tokens, height: 180, aria: `Cold-cache refires per ${hourly ? "hour" : "day"}`,
+    empty: hourly ? "No refires today." : "No refires in this range.",
+    color: () => "var(--ink-2)",
+    extraRows: (c) => CAUSES
+      .map(([k]) => [k, c.recs.filter(e => e.cause === k)])
+      .filter(([, es]) => es.length)
+      .map(([k, es]) => ({
+        value: `${es.length}×`,
+        name: `${k}: ${tokens ? fmtTok(sum(es, e => e.tok)) : fmt$(sum(es, e => e.extra))}` })),
+    totalName: tokens ? "tokens rebuilt" : "extra cost",
+  });
+
+  // cause table
+  const host = $("#refireTable");
+  host.textContent = "";
+  if (!evs.length) return;
+  const tbl = el("table"), thead = el("thead"), trh = el("tr");
+  for (const [h, c] of [["Cause", ""], ["What it means", ""], ["Refires", "num"],
+                        ["Rebuilt", "num"], ["Extra cost", "num"], ["Share", "num"]]) {
+    trh.appendChild(el("th", c || null, h));
   }
+  thead.appendChild(trh); tbl.appendChild(thead);
+  const tbody = el("tbody");
+  for (const [k, meaning] of CAUSES) {
+    const es = evs.filter(e => e.cause === k);
+    if (!es.length) continue;
+    const tr = el("tr");
+    tr.appendChild(el("td", "name", k));
+    tr.appendChild(el("td", null, meaning));
+    const x = sum(es, e => e.extra);
+    for (const v of [fmtInt(es.length), fmtTok(sum(es, e => e.tok)), fmt$(x), pct(x, extra)]) {
+      tr.appendChild(el("td", "num", v));
+    }
+    tbody.appendChild(tr);
+  }
+  tbl.appendChild(tbody);
+  host.appendChild(tbl);
 }
 
 /* ---------- horizontal bar charts ---------- */
@@ -557,14 +695,9 @@ function renderHBars(hostSel, items, colorF, tipTitle) {
       const isEnd = si === segs.length - 1;
       // 2px surface gap between segments; the last one gets the rounded end
       const sw = Math.max(isEnd ? 2 : 1, (s.v / it.total) * w - (isEnd ? 0 : 2));
-      const p = svgEl("path");
-      p.setAttribute("d", isEnd ? barRightPath(x, yc - bh / 2, sw, bh, 4)
-                                : `M${x},${yc - bh / 2} h${sw} v${bh} h${-sw} Z`);
-      p.setAttribute("fill", colorF(it));
-      if (s.light) p.setAttribute("fill-opacity", INPUT_OPACITY);
-      p.setAttribute("class", "hbar");
-      svg.appendChild(p);
-      parts.push(p);
+      parts.push(...drawSeg(svg, isEnd ? barRightPath(x, yc - bh / 2, sw, bh, 4)
+                                       : `M${x},${yc - bh / 2} h${sw} v${bh} h${-sw} Z`,
+                            colorF(it), s, "hbar"));
       x += sw + 2;
     });
 
@@ -583,7 +716,8 @@ function renderHBars(hostSel, items, colorF, tipTitle) {
     const over = (e) => {
       parts.forEach(s => s.style.filter = "brightness(1.12)");
       showTip(e, it.name, it.detail.map(([name, value, key]) =>
-        ({ color: key === "none" ? null : colorF(it), light: key === "light", value, name })));
+        ({ color: key === "none" ? null : colorF(it), light: key === "light" || key === "hatch",
+           hatch: key === "hatch", value, name })));
     };
     hit.addEventListener("pointermove", over);
     hit.addEventListener("focus", () => over({ clientX: innerWidth / 2, clientY: innerHeight / 2 }));
@@ -644,22 +778,26 @@ function render() {
 
   renderTiles(recs);
   renderTime(recs);
+  renderRefires(recs);
 
   // the Show switch scopes these too: cost, or new input + output like the time chart
   const tokens = state.metric === "tokens";
   const what = tokens ? "Tokens" : "Cost";
   const desc = tokens
-    ? "New input (light) and output (solid) for the selected range; cache reads in the tooltip"
+    ? "Rebuilt after a cold cache (striped), new input (light) and output (solid); cache reads in the tooltip"
     : "API-equivalent cost for the selected range";
   $("#modelTitle").textContent = `${what} by model`;
   $("#projTitle").textContent = `${what} by project`;
   $("#modelDesc").textContent = $("#projDesc").textContent = desc;
   const hItem = (name, b, extra) => {
-    const segs = tokens ? [{ v: b.ti + b.c5 + b.c1, light: true }, { v: b.to }] : [{ v: b.cost }];
+    const segs = tokens
+      ? [{ v: b.rw, light: true, hatch: true }, { v: b.ti + b.c5 + b.c1 - b.rw, light: true }, { v: b.to }]
+      : [{ v: b.cost }];
     return {
       name, ...extra, segs, total: segs.reduce((a, s) => a + s.v, 0),
       detail: tokens
-        ? [["output", fmtTok(b.to)], ["new input", fmtTok(b.ti + b.c5 + b.c1), "light"],
+        ? [["output", fmtTok(b.to)], ["new input", fmtTok(b.ti + b.c5 + b.c1 - b.rw), "light"],
+           ["rebuilt (cold cache)", fmtTok(b.rw), "hatch"],
            ["cache reads (not charted)", fmtTok(b.cr), "none"], ["API cost", fmt$(b.cost), "none"]]
         : [["API cost", fmt$(b.cost)], ["messages", fmtInt(b.n)],
            ["output tokens", fmtTok(b.to)]],
