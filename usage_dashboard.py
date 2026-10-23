@@ -13,6 +13,7 @@ Usage:
     python usage_dashboard.py --import-only  # just update the history DB
     claude-use --install                 # (release exe) install into ~/.local/bin
     claude-use --uninstall               # remove it again; keeps history and settings
+    claude-use --schedule-import [DAYS]  # run --import-only every DAYS days (default 1)
 
 No dependencies beyond the standard library.
 """
@@ -468,7 +469,8 @@ def remove_installed_exe() -> None:
 
 
 def warn_scheduled_tasks() -> None:
-    """List scheduled jobs that mention the app. Never delete them: I made them."""
+    """List scheduled jobs that mention the app. Run after unschedule_import(),
+    so anything left was made by hand: never delete it."""
     import subprocess
 
     hits = []
@@ -500,12 +502,209 @@ def warn_scheduled_tasks() -> None:
             print(f"  {h}")
 
 
+# Scheduled import: one job, found by fixed name, that runs the installed exe
+# with --import-only every N days, so history survives weeks without opening
+# the dashboard. Re-running replaces it; --uninstall removes it.
+
+JOB_NAME = f"{APP} import"     # Windows task name and crontab marker
+JOB_UNIT = f"{APP}-import"     # systemd units / launchd label
+
+
+def _cleanup_period_days() -> int:
+    try:
+        settings = json.loads((Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        return int(settings.get("cleanupPeriodDays", 30))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 30  # Claude Code's default
+
+
+def _systemd_dir() -> Path:
+    return _xdg_base("XDG_CONFIG_HOME", ".config") / "systemd" / "user"
+
+
+def _launchd_plist() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{JOB_UNIT}.plist"
+
+
+def _has_systemd_user() -> bool:
+    import subprocess
+
+    if not shutil.which("systemctl"):
+        return False
+    return subprocess.run(["systemctl", "--user", "show-environment"],
+                          capture_output=True).returncode == 0
+
+
+def _strip_crontab() -> tuple[str, bool]:
+    """Current crontab without our line, and whether it had one."""
+    import subprocess
+
+    try:
+        out = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+    except OSError:  # no cron installed
+        return "", False
+    keep = [line for line in out.splitlines() if not line.endswith(f"# {JOB_NAME}")]
+    return "".join(f"{line}\n" for line in keep), len(keep) != len(out.splitlines())
+
+
+def _windows_task_xml(days: int) -> str:
+    start = datetime.now().strftime("%Y-%m-%dT12:00:00")
+    # conhost --headless: a console exe started by Task Scheduler otherwise
+    # opens a window on every run. StartWhenAvailable: a laptop that was off
+    # at noon catches up at the next chance.
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Copy new Claude Code transcript data into the claude-use history DB.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>{start}</StartBoundary>
+      <ScheduleByDay><DaysInterval>{days}</DaysInterval></ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>conhost.exe</Command>
+      <Arguments>--headless "{INSTALLED_EXE}" --import-only</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def schedule_import(days: int) -> None:
+    import subprocess
+
+    if not INSTALLED_EXE.exists():
+        sys.exit(f"{INSTALLED_EXE} not found: run claude-use --install first."
+                 " The scheduled job runs the installed copy, never a checkout.")
+    cleanup = _cleanup_period_days()
+    if days * 2 > cleanup:
+        print(f"Warning: every {days} days is not well below cleanupPeriodDays ({cleanup}):"
+              " transcripts may be deleted before a missed run catches up.")
+    every = "daily" if days == 1 else f"every {days} days"
+
+    if sys.platform == "win32":
+        # XML in through an env var, so no PowerShell quoting to get wrong;
+        # -Force replaces an existing task of the same name
+        script = ("Register-ScheduledTask -TaskName $env:CU_TASK -Xml $env:CU_XML -Force"
+                  " | Out-Null")
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                       env={**os.environ, "CU_TASK": JOB_NAME,
+                            "CU_XML": _windows_task_xml(days)},
+                       check=True)
+        print(f'Scheduled task "{JOB_NAME}": {every} at noon, or at the next chance if missed')
+    elif sys.platform == "darwin":
+        import plistlib
+
+        plist = _launchd_plist()
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        domain = f"gui/{os.getuid()}"
+        subprocess.run(["launchctl", "bootout", f"{domain}/{JOB_UNIT}"], capture_output=True)
+        # launchd runs a missed interval on wake
+        plist.write_bytes(plistlib.dumps({
+            "Label": JOB_UNIT,
+            "ProgramArguments": [str(INSTALLED_EXE), "--import-only"],
+            "StartInterval": days * 86400,
+        }))
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True)
+        print(f"Scheduled launchd agent {plist}: {every}")
+    elif _has_systemd_user():
+        units = _systemd_dir()
+        units.mkdir(parents=True, exist_ok=True)
+        # day-of-month step: never more than N days apart, though it resets
+        # on the 1st; Persistent catches up a run missed while powered off
+        when = "*-*-* 12:00:00" if days == 1 else f"*-*-01/{days} 12:00:00"
+        (units / f"{JOB_UNIT}.service").write_text(
+            "[Unit]\n"
+            "Description=Copy new Claude Code transcript data into the claude-use history DB\n"
+            "\n"
+            "[Service]\n"
+            "Type=oneshot\n"
+            f'ExecStart="{INSTALLED_EXE}" --import-only\n', encoding="utf-8")
+        (units / f"{JOB_UNIT}.timer").write_text(
+            "[Unit]\n"
+            f"Description=claude-use import, {every}\n"
+            "\n"
+            "[Timer]\n"
+            f"OnCalendar={when}\n"
+            "Persistent=true\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=timers.target\n", encoding="utf-8")
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", f"{JOB_UNIT}.timer"],
+                       check=True, capture_output=True)
+        print(f"Scheduled systemd user timer {units / f'{JOB_UNIT}.timer'}: {every}")
+    else:
+        if not shutil.which("crontab"):
+            sys.exit("No systemd user session and no crontab: schedule"
+                     f" {INSTALLED_EXE} --import-only yourself.")
+        crontab, _ = _strip_crontab()
+        dom = "*" if days == 1 else f"*/{days}"
+        crontab += f'0 12 {dom} * * "{INSTALLED_EXE}" --import-only # {JOB_NAME}\n'
+        subprocess.run(["crontab", "-"], input=crontab, text=True, check=True)
+        print(f"Scheduled crontab entry: {every} at noon (cron doesn't catch up missed runs)")
+    print(f"  runs: {INSTALLED_EXE} --import-only")
+
+
+def unschedule_import() -> bool:
+    """Remove the job schedule_import made, if any. True if one was removed."""
+    import subprocess
+
+    removed = False
+    if sys.platform == "win32":
+        removed = subprocess.run(["schtasks", "/delete", "/tn", JOB_NAME, "/f"],
+                                 capture_output=True).returncode == 0
+        if removed:
+            print(f'Removed scheduled task "{JOB_NAME}"')
+    elif sys.platform == "darwin":
+        plist = _launchd_plist()
+        if plist.exists():
+            subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{JOB_UNIT}"],
+                           capture_output=True)
+            plist.unlink()
+            print(f"Removed {plist}")
+            removed = True
+    else:
+        timer = _systemd_dir() / f"{JOB_UNIT}.timer"
+        if timer.exists():
+            subprocess.run(["systemctl", "--user", "disable", "--now", timer.name],
+                           capture_output=True)
+            for f in (timer, timer.with_suffix(".service")):
+                f.unlink(missing_ok=True)
+                print(f"Removed {f}")
+            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+            removed = True
+        crontab, had = _strip_crontab()
+        if had:
+            subprocess.run(["crontab", "-"], input=crontab, text=True, check=True)
+            print("Removed the claude-use import line from crontab")
+            removed = True
+    return removed
+
+
 def uninstall() -> None:
     remove_entry_points()
     if OUT_HTML.parent.exists():
         shutil.rmtree(OUT_HTML.parent)
         print(f"Removed {OUT_HTML.parent}")
     remove_installed_exe()
+    unschedule_import()
     warn_scheduled_tasks()
 
     left = [d for d in (CONFIG_FILE.parent, DEFAULT_DB.parent) if d.exists()]
@@ -724,6 +923,13 @@ def print_summary(data: dict) -> None:
               f'  ->  API would cost {total / sub:,.1f}x more' if sub else "")
 
 
+def _positive_int(s: str) -> int:
+    n = int(s)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, not {n}")
+    return n
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -740,8 +946,14 @@ def main() -> None:
     ap.add_argument("--data-dir", type=Path, metavar="PATH",
                     help="with --install: back up the history DB to this folder")
     ap.add_argument("--uninstall", action="store_true",
-                    help="remove the installed executable and its shortcuts;"
-                         " keeps settings, history and backup")
+                    help="remove the installed executable, its shortcuts and its"
+                         " scheduled import; keeps settings, history and backup")
+    ap.add_argument("--schedule-import", type=_positive_int, nargs="?", const=1,
+                    metavar="DAYS",
+                    help="run the installed executable with --import-only every DAYS"
+                         " days (default 1); run again to change it")
+    ap.add_argument("--unschedule-import", action="store_true",
+                    help="remove the job --schedule-import made")
     ap.add_argument("--pause", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--version", action="version", version=f"claude-use {__version__}")
     args = ap.parse_args()
@@ -758,6 +970,13 @@ def main() -> None:
                 input("\nPress Enter to close.")
             except EOFError:
                 pass
+        return
+    if args.schedule_import:
+        schedule_import(args.schedule_import)
+        return
+    if args.unschedule_import:
+        if not unschedule_import():
+            print("No scheduled import to remove.")
         return
 
     # --db is for one-off use, so only the default DB is seeded and snapshotted

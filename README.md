@@ -44,8 +44,9 @@ To uninstall, run `claude-use --uninstall` (or use Installed apps on Windows). I
 removes the executable, the shortcuts and `~/.cache/claude-use`, and prints what
 it leaves behind for you to delete by hand if you're done with them: your settings
 (`~/.config/claude-use`), the history DB (`~/.local/share/claude-use`) and the
-backup copy. It warns about any scheduled task that still runs `claude-use`, but
-doesn't remove it.
+backup copy. It removes the job `--schedule-import` made (see
+[Scheduled import](#scheduled-import-optional)), and warns about any other
+scheduled task that still runs `claude-use`, but doesn't remove it.
 
 The installed `claude-use` takes the same options as the script below.
 
@@ -55,7 +56,7 @@ The installed `claude-use` takes the same options as the script below.
 python usage_dashboard.py              # print summary, write dashboard.html, open browser
 python usage_dashboard.py --no-open    # just generate dashboard.html
 python usage_dashboard.py --serve      # live server on http://localhost:8377 (re-parses on refresh)
-python usage_dashboard.py --import-only  # just update the history DB (for a scheduled task)
+python usage_dashboard.py --import-only  # just update the history DB (what the scheduled import runs)
 python usage_dashboard.py --db PATH    # use a different history DB, one-off
 ```
 
@@ -105,10 +106,31 @@ run stops with an error instead of creating it. `--db` runs skip the snapshot.
 Run it from one machine only: the last machine to finish overwrites the snapshot.
 
 Only history since the first run can be kept, so it's worth raising
-`cleanupPeriodDays` as well, and running `--import-only` from Task Scheduler if
-you go weeks without opening the dashboard. Point the task at the installed
-executable, `%USERPROFILE%\.local\bin\claude-use.exe --import-only`, not at a
-checkout of this repo.
+`cleanupPeriodDays` as well.
+
+### Scheduled import (optional)
+
+Every launch imports first, so this only matters if you might go longer than
+`cleanupPeriodDays` without opening the dashboard. To have the installed
+executable run `--import-only` in the background:
+
+```powershell
+claude-use --schedule-import      # daily
+claude-use --schedule-import 7    # every 7 days
+claude-use --unschedule-import    # remove it
+```
+
+Running it again replaces the job, so that's also how you change the interval.
+It warns if the interval isn't well below `cleanupPeriodDays`. The job always
+runs `~/.local/bin/claude-use`, so `--install` first.
+
+- **Windows:** a Task Scheduler task, `claude-use import`, at noon, as you, with
+  no console window. A run missed while the PC was off happens at the next
+  chance.
+- **Linux:** a systemd user timer (`~/.config/systemd/user/claude-use-import.timer`),
+  persistent, so missed runs catch up. With no systemd user session it falls back
+  to a crontab line, which doesn't catch up.
+- **macOS:** a launchd agent (`~/Library/LaunchAgents/claude-use-import.plist`).
 
 `dashboard.html` is fully self-contained (data embedded, no CDN, works offline)
 and supports light/dark mode. It shows:
