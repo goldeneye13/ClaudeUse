@@ -149,7 +149,12 @@ and supports light/dark mode. It shows:
 - **Cold-cache refires**: requests that rebuilt their whole context because the
   cache was gone, with their count, tokens rebuilt, extra cost (writing the
   context instead of reading it warm), warm-cache hit rate, a per-day (or
-  per-hour) chart and a table of causes. See below.
+  per-hour) chart, a table of causes and the refires per project. See below.
+- **Breaks and the cache clock**: a histogram of how long you were away before
+  coming back to a session (breaks of 5 minutes or more), with the 60-minute
+  cache expiry marked and the returns that rebuilt the context striped. Plus
+  **close calls**: returns 45 to 60 minutes later with the cache still warm, per
+  day, and what rebuilding that context would have cost.
 - by model and by project: bars that follow the Cost/Tokens switch, plus detail
   tables with every token type and cost
 - range filter (Today / 7 / 30 / 90 days / all) that re-scopes everything. Ranges

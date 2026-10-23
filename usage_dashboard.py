@@ -21,6 +21,7 @@ No dependencies beyond the standard library.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import os
 import re
@@ -101,6 +102,13 @@ REFIRE_MIN_CONTEXT = 20_000
 REFIRE_WRITE_SHARE = 0.8
 # Claude Code writes cache with a 1h TTL (5m writes are ~0.1% of the total)
 CACHE_TTL_S = 3600
+# Breaks histogram (JMR-149): gaps between requests in a transcript, from 5 min
+# (shorter is the agent working, or you reading its output). Bucket i holds
+# (edge i, edge i+1]; CACHE_TTL_S must be an edge so the expiry line falls between bars.
+GAP_EDGES_S = (300, 900, 1800, 2700, 3600, 7200, 14400, 28800, 86400)
+GAP_LABELS = ("5-15m", "15-30m", "30-45m", "45-60m", "1-2h", "2-4h", "4-8h", "8-24h", "1d+")
+# close call: back within the last 15 minutes of the cache's life, still warm
+CLOSE_CALL_S = 2700
 WEB_SEARCH_PER_1K = 10.0  # $10 per 1,000 searches. Web fetch is free.
 
 
@@ -883,6 +891,8 @@ def aggregate(db: Path) -> dict:
     agg: dict[tuple, dict] = defaultdict(sums)
     hourly: dict[tuple, dict] = defaultdict(sums)
     refires = []
+    gaps: dict[tuple, int] = defaultdict(int)  # (date, bucket, rebuilt) -> requests
+    close_calls = []
     for ts, model, speed, proj, *tok, sid, side, gap, compact, switched in msgs:
         t = local_time(ts)
         d = t.strftime("%Y-%m-%d")
@@ -899,6 +909,15 @@ def aggregate(db: Path) -> dict:
                             "p": proj_names.get(proj, proj), "cause": cause,
                             "tok": rw, "extra": round(extra, 4),
                             "gap": None if gap is None else round(gap)})
+        if gap is not None and gap >= GAP_EDGES_S[0]:
+            b = max(0, bisect.bisect_left(GAP_EDGES_S, gap) - 1)
+            gaps[(d, b, int(bool(cause)))] += 1
+            if not cause and CLOSE_CALL_S <= gap <= CACHE_TTL_S:
+                # what rebuilding that context would have cost: 1h writes, not reads
+                rin, _, cache_r = rates_for(model, speed)
+                close_calls.append({"d": d, "h": t.hour, "p": proj_names.get(proj, proj),
+                                    "gap": round(gap), "tok": cr,
+                                    "saved": round(cr * rin * (CACHE_W1 - cache_r) / 1e6, 4)})
 
     records = [{"d": d, "p": proj, **priced(model, speed, a)}
                for (d, model, speed, proj), a in sorted(agg.items())]
@@ -914,6 +933,12 @@ def aggregate(db: Path) -> dict:
         "hourly": hours,
         "refires": sorted(refires, key=lambda r: (r["d"], r["h"])),
         "cacheTtlMin": CACHE_TTL_S // 60,
+        "gapLabels": GAP_LABELS,
+        "gapTtlBucket": GAP_EDGES_S.index(CACHE_TTL_S),  # first bucket past expiry
+        "gaps": [{"d": d, "b": b, "rebuilt": rebuilt, "n": n}
+                 for (d, b, rebuilt), n in sorted(gaps.items())],
+        "closeCalls": sorted(close_calls, key=lambda e: (e["d"], e["h"])),
+        "closeCallMin": CLOSE_CALL_S // 60,
     }
 
 
