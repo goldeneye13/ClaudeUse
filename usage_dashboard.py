@@ -921,19 +921,26 @@ def notify(title: str, body: str) -> None:
     import subprocess
 
     if sys.platform == "win32":
-        # text in through env vars, so no PowerShell quoting to get wrong
+        from xml.sax.saxutils import escape
+
+        # scenario="reminder": stays on screen until dismissed (a plain toast's
+        # banner is gone in ~5 s) and can show through Do not disturb; it needs
+        # at least one button to do that
+        toast = ('<toast scenario="reminder"><visual><binding template="ToastGeneric">'
+                 f"<text>{escape(title)}</text><text>{escape(body)}</text></binding></visual>"
+                 '<actions><action content="Dismiss" arguments="dismiss" activationType="system"/>'
+                 '</actions><audio src="ms-winsoundevent:Notification.Reminder"/></toast>')
+        # XML in through an env var, so no PowerShell quoting to get wrong
         script = (
             "$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications,"
             " ContentType = WindowsRuntime];"
-            " $x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent("
-            "[Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
-            " $t = $x.GetElementsByTagName('text');"
-            " $null = $t.Item(0).AppendChild($x.CreateTextNode($env:CU_TITLE));"
-            " $null = $t.Item(1).AppendChild($x.CreateTextNode($env:CU_BODY));"
+            " $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument,"
+            " ContentType = WindowsRuntime];"
+            " $x = New-Object Windows.Data.Xml.Dom.XmlDocument; $x.LoadXml($env:CU_TOAST);"
             " [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:CU_APP)"
             ".Show([Windows.UI.Notifications.ToastNotification]::new($x))")
         subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                       env={**os.environ, "CU_TITLE": title, "CU_BODY": body, "CU_APP": PS_APP_ID},
+                       env={**os.environ, "CU_TOAST": toast, "CU_APP": PS_APP_ID},
                        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
     elif sys.platform == "darwin":
         subprocess.run(["osascript", "-e", 'display notification (system attribute "CU_BODY")'
