@@ -77,8 +77,11 @@ which covers everything since the first run.
 - Only token counts are stored, never cost. Cost is computed from `PRICING` at
   render time, so rate corrections apply to the whole history.
 - It's a plain SQLite file: open it with [DB Browser for SQLite](https://sqlitebrowser.org/),
-  DBeaver, the `sqlite3` CLI, or Python. Close other tools before running the
-  dashboard, and don't open it from two machines at once.
+  DBeaver, the `sqlite3` CLI, or Python. In DB Browser, use **File > Open
+  Database Read-Only**: unsaved changes there (a cell edit, an UPDATE not yet
+  written) lock the DB, and the dashboard or a scheduled import waits 15 s, then
+  stops with a one-line message and changes nothing. Don't open it from two
+  machines at once.
 
 ### Backup copy (optional)
 
