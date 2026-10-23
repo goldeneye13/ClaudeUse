@@ -14,12 +14,20 @@ Each [release](https://github.com/goldeneye13/ClaudeUse/releases) has a standalo
 They're unsigned, so expect a first-run warning: on Windows click **More info →
 Run anyway**; on macOS run `xattr -d com.apple.quarantine claude-use` once.
 
-Download it, then install it from wherever it landed:
+Download it, then install it from wherever it landed, with everything:
 
 ```powershell
-.\claude-use-windows-x64.exe --install     # or ./claude-use --install
+.\claude-use-windows-x64.exe --install --all     # or ./claude-use --install --all
 claude-use --version
 ```
+
+`--all` adds the two opt-in extras to the install: a daily
+[scheduled import](#scheduled-import-optional) and the
+[cache clock](#cache-clock-optional) in Claude Code. For a different interval, add
+`--schedule-import 7`. Leave out `--all` to install the app alone, or name the extras
+you want (`--install --enable-clock`). If an extra can't be set up (e.g. you
+already have your own status line), the rest still installs. It tells you what to
+run once that's fixed, and exits with code 1.
 
 `--install` copies the executable to `~/.local/bin/` (`~` is `%USERPROFILE%` on
 Windows; put that folder on `PATH` if it isn't), creates its folders, and on the
