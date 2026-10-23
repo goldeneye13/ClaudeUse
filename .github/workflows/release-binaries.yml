@@ -67,16 +67,50 @@ jobs:
           XDG_CACHE_HOME: ${{ runner.temp }}/cache
         run: |
           mkdir -p ~/.claude/projects
-          dist/claude-use --install --data-dir "$RUNNER_TEMP/backup" < /dev/null
+          # --all twice: the second run must change nothing
+          dist/claude-use --install --all --data-dir "$RUNNER_TEMP/backup" < /dev/null
+          dist/claude-use --install --all < /dev/null
           ~/.local/bin/claude-use --no-open
           test -s "$XDG_CACHE_HOME/claude-use/dashboard.html"
           test -s "$RUNNER_TEMP/backup/usage.sqlite"
+          test "$(grep -c -- '--arm-clock' ~/.claude/settings.json)" = 1
+          grep -q -- '--statusline' ~/.claude/settings.json
           case "$RUNNER_OS" in
             Windows)
               test -f "$APPDATA/Microsoft/Windows/Start Menu/Programs/Claude Use.lnk"
-              reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\claude-use' ;;
+              reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\claude-use'
+              MSYS_NO_PATHCONV=1 schtasks /query /tn "claude-use import" ;;
             Linux)
-              cat "$XDG_DATA_HOME/applications/claude-use.desktop" ;;
+              cat "$XDG_DATA_HOME/applications/claude-use.desktop"
+              if [ -f "$XDG_CONFIG_HOME/systemd/user/claude-use-import.timer" ]; then
+                cat "$XDG_CONFIG_HOME/systemd/user/claude-use-import.timer"
+              else
+                test "$(crontab -l | grep -c 'claude-use import')" = 1
+              fi ;;
+            macOS)
+              cat ~/Library/LaunchAgents/claude-use-import.plist ;;
+          esac
+
+      # the cache clock against a fake transcript, last used 5 s ago
+      - name: Smoke test cache clock
+        run: |
+          t="$RUNNER_TEMP/clock.jsonl"
+          now=$(python -c "import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(seconds=5)).isoformat().replace('+00:00', 'Z'))")
+          echo "{\"type\":\"assistant\",\"timestamp\":\"$now\",\"cwd\":\"/tmp\",\"message\":{\"model\":\"claude-sonnet-5\",\"id\":\"m1\",\"usage\":{\"input_tokens\":3,\"cache_read_input_tokens\":50000,\"output_tokens\":9}}}" > "$t"
+          hook=$(python -c "import json, os, sys; print(json.dumps({'session_id': 'ci-clock', 'transcript_path': os.path.normpath(sys.argv[1])}))" "$t")
+          line=$(echo "$hook" | ~/.local/bin/claude-use --statusline)
+          echo "$line"; case "$line" in "cache warm until "*) ;; *) exit 1 ;; esac
+          echo "$hook" | ~/.local/bin/claude-use --arm-clock
+          case "$RUNNER_OS" in
+            Windows) MSYS_NO_PATHCONV=1 schtasks /query /tn '\claude-use\clock\ci-clock' ;;
+            Linux) systemctl --user list-timers 'claude-use-clock-*' 2>/dev/null | grep -q ci-clock \
+                     || test -s ~/.local/state/claude-use/clock/ci-clock.pid ;;
+            macOS) test -s ~/.local/state/claude-use/clock/ci-clock.pid ;;
+          esac
+          echo "$hook" | ~/.local/bin/claude-use --cancel-clock
+          case "$RUNNER_OS" in
+            Windows) if MSYS_NO_PATHCONV=1 schtasks /query /tn '\claude-use\clock\ci-clock'; then exit 1; fi ;;
+            *) test ! -e ~/.local/state/claude-use/clock/ci-clock.pid ;;
           esac
 
       # uninstall from the installed copy itself: on Windows that's the
@@ -95,12 +129,19 @@ jobs:
           test -s "$XDG_CONFIG_HOME/claude-use/config.toml"
           test -s "$XDG_DATA_HOME/claude-use/usage.sqlite"
           test -s "$RUNNER_TEMP/backup/usage.sqlite"
+          # the clock entries and the import job are gone too
+          if grep -q claude-use ~/.claude/settings.json; then exit 1; fi
           case "$RUNNER_OS" in
             Windows)
               test ! -e "$APPDATA/Microsoft/Windows/Start Menu/Programs/Claude Use.lnk"
-              if reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\claude-use'; then exit 1; fi ;;
+              if reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\claude-use'; then exit 1; fi
+              if MSYS_NO_PATHCONV=1 schtasks /query /tn "claude-use import"; then exit 1; fi ;;
             Linux)
-              test ! -e "$XDG_DATA_HOME/applications/claude-use.desktop" ;;
+              test ! -e "$XDG_DATA_HOME/applications/claude-use.desktop"
+              test ! -e "$XDG_CONFIG_HOME/systemd/user/claude-use-import.timer"
+              if crontab -l 2>/dev/null | grep -q claude-use; then exit 1; fi ;;
+            macOS)
+              test ! -e ~/Library/LaunchAgents/claude-use-import.plist ;;
           esac
 
       # tar keeps the executable bit, which a bare download would lose

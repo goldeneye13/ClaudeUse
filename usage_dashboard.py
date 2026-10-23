@@ -11,7 +11,7 @@ Usage:
     python usage_dashboard.py --no-open  # just generate
     python usage_dashboard.py --serve    # serve on http://localhost:8377 (regenerates per request)
     python usage_dashboard.py --import-only  # just update the history DB
-    claude-use --install                 # (release exe) install into ~/.local/bin
+    claude-use --install [--all]         # (release exe) install into ~/.local/bin; --all adds the extras below
     claude-use --uninstall               # remove it again; keeps history and settings
     claude-use --schedule-import [DAYS]  # run --import-only every DAYS days (default 1)
     claude-use --enable-clock            # status line + toast before a session's cache expires
@@ -1321,6 +1321,34 @@ def print_summary(data: dict) -> None:
               f'  ->  API would cost {total / sub:,.1f}x more' if sub else "")
 
 
+def install_extras(schedule_days: int | None, clock: bool) -> None:
+    """The opt-in steps after --install. One that can't be done is reported and
+    skipped, the rest still run, and the exit code says something was skipped."""
+    import subprocess
+
+    steps = []
+    if schedule_days:
+        steps.append((lambda: schedule_import(schedule_days),
+                      "claude-use --schedule-import" + (f" {schedule_days}" if schedule_days > 1 else "")))
+    if clock:
+        steps.append((enable_clock, "claude-use --enable-clock"))
+    skipped = []
+    for run, retry in steps:
+        print()
+        try:
+            run()
+        except (SystemExit, OSError, subprocess.CalledProcessError) as e:
+            if isinstance(e, SystemExit) and not e.code:
+                continue
+            print(f"Skipped: {e.code if isinstance(e, SystemExit) else e}")
+            skipped.append(retry)
+    if skipped:
+        print("\nInstalled, but not everything was set up. Once fixed, run:")
+        for retry in skipped:
+            print(f"  {retry}")
+        sys.exit(1)
+
+
 def _positive_int(s: str) -> int:
     n = int(s)
     if n < 1:
@@ -1343,6 +1371,9 @@ def main() -> None:
                     help=f"copy this executable to {BIN_DIR} and set up its folders")
     ap.add_argument("--data-dir", type=Path, metavar="PATH",
                     help="with --install: back up the history DB to this folder")
+    ap.add_argument("--all", action="store_true",
+                    help="with --install: also --schedule-import (daily unless DAYS is"
+                         " given) and --enable-clock")
     ap.add_argument("--uninstall", action="store_true",
                     help="remove the installed executable, its shortcuts and its"
                          " scheduled import; keeps settings, history and backup")
@@ -1381,18 +1412,21 @@ def main() -> None:
     if args.clock_fire:
         clock_fire(args.clock_fire[0], Path(args.clock_fire[1]), args.clock_delay)
         return
-    if args.enable_clock:
-        enable_clock()
-        return
     if args.disable_clock:
         if not disable_clock():
             print("The cache clock isn't on.")
         return
 
-    if args.data_dir and not args.install:
-        ap.error("--data-dir only works with --install")
+    for flag in ("data_dir", "all"):
+        if getattr(args, flag) and not args.install:
+            ap.error(f"--{flag.replace('_', '-')} only works with --install")
     if args.install:
         install(args.data_dir.expanduser().absolute() if args.data_dir else None)
+        install_extras(schedule_days=args.schedule_import or (1 if args.all else None),
+                       clock=args.enable_clock or args.all)
+        return
+    if args.enable_clock:
+        enable_clock()
         return
     if args.uninstall:
         uninstall()
