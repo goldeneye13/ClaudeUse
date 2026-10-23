@@ -168,6 +168,7 @@ def scan() -> dict[str, tuple]:
     # dedupe key -> row (same message can be written on several lines while
     # streaming; the last line wins, as before)
     rows: dict[str, tuple] = {}
+    searches: dict[str, set] = defaultdict(set)  # dedupe key -> WebSearch tool_use ids
 
     for f in CLAUDE_PROJECTS.rglob("*.jsonl"):
         # project = top-level folder (subagent transcripts nest deeper)
@@ -204,6 +205,10 @@ def scan() -> dict[str, tuple]:
                     c5, c1 = u.get("cache_creation_input_tokens", 0), 0
                 st = u.get("server_tool_use") or {}
                 key = f'{e.get("requestId", "")}:{msg.get("id") or e.get("uuid")}'
+                searches[key].update(
+                    b.get("id") for b in msg.get("content") or ()
+                    if isinstance(b, dict) and b.get("type") == "tool_use"
+                    and b.get("name") == "WebSearch")
                 file_rows[key] = (
                     key, ts, model, u.get("speed", "standard"), proj_dir, e.get("cwd"),
                     u.get("input_tokens", 0), u.get("output_tokens", 0), c5, c1,
@@ -225,6 +230,14 @@ def scan() -> dict[str, tuple]:
                        int(r[2] != prev[2]))
             rows[r[0]] = r + ctx
             prev = r
+
+    # Claude Code runs WebSearch as a separate request that never reaches the
+    # transcript, so web_search_requests is always 0: count the tool calls
+    # instead. Ids from every line, since a response is written one content
+    # block per line and only the last line is kept above.
+    for key, ids in searches.items():
+        r = rows[key]
+        rows[key] = r[:11] + (max(r[11], len(ids)),) + r[12:]
     return rows
 
 

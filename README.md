@@ -215,6 +215,13 @@ at $10/$50 with the cache multipliers stacked on top; those rows are labelled
 
 **Web search** costs $10 per 1,000 searches. **Web fetch is free** — you only pay
 for the fetched content as input tokens, so `web_fetch_requests` is not billed.
+Claude Code runs each `WebSearch` as a separate background request that isn't
+written to the transcript, so `web_search_requests` there is always 0. Searches
+are counted from the `WebSearch` tool calls instead (the larger of the two, so
+nothing counts twice). That prices the search fee, but the tokens that background
+request spends on the results aren't in the transcript and aren't counted.
+History imported before this change keeps 0 searches once its transcripts are
+gone.
 
 The full 1M-token context window is charged at standard rates on Claude 4.6 and
 later, so there is no long-context premium tier to account for. Estimates use
