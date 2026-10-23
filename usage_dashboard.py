@@ -30,6 +30,7 @@ import sys
 import tomllib
 import webbrowser
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -227,9 +228,31 @@ def scan() -> dict[str, tuple]:
     return rows
 
 
+# A DB viewer with unsaved changes (DB Browser for SQLite) holds a write lock;
+# wait this long for it before giving up. The import is one transaction, so
+# giving up leaves the DB untouched.
+DB_TIMEOUT_S = 15
+
+
+class DbLocked(Exception):
+    pass
+
+
+@contextmanager
+def friendly_lock_errors(db: Path):
+    """Turn SQLite's "database is locked" into a DbLocked with a one-line message."""
+    try:
+        yield
+    except sqlite3.OperationalError as e:
+        if "locked" not in str(e):
+            raise
+        raise DbLocked(f"{db} is locked by another program (DB Browser with unsaved"
+                       " changes?). Write or revert the changes there and rerun.") from None
+
+
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=DB_TIMEOUT_S)
     conn.executescript(SCHEMA)
     have = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
     with conn:
@@ -295,7 +318,7 @@ def seed_db(live: Path, owned: Path | None) -> None:
 def snapshot(live: Path, owned: Path) -> None:
     tmp = owned.with_suffix(".sqlite.tmp")
     tmp.unlink(missing_ok=True)                    # VACUUM INTO refuses an existing file
-    conn = sqlite3.connect(live)
+    conn = sqlite3.connect(live, timeout=DB_TIMEOUT_S)
     try:
         conn.execute("VACUUM INTO ?", (str(tmp),))  # consistent copy, even mid-write
     finally:
@@ -882,15 +905,17 @@ def aggregate(db: Path) -> dict:
 
 
 def update_history(db: Path, owned: Path | None) -> None:
-    import_transcripts(db)
-    if owned:
-        snapshot(db, owned)
+    with friendly_lock_errors(db):
+        import_transcripts(db)
+        if owned:
+            snapshot(db, owned)
 
 
 def collect(db: Path, owned: Path | None) -> dict:
     """Copy new transcript data into the history DB, then aggregate all of it."""
     update_history(db, owned)
-    return aggregate(db)
+    with friendly_lock_errors(db):
+        return aggregate(db)
 
 
 def render(data: dict) -> str:
@@ -987,10 +1012,14 @@ def main() -> None:
         seed_db(args.db, owned)
 
     if args.import_only:
-        update_history(args.db, owned)
+        try:
+            update_history(args.db, owned)
+        except DbLocked as e:
+            sys.exit(str(e))  # non-zero exit: Task Scheduler shows it as Last Run Result
         return
 
     if args.serve:
+        import html
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
         class H(BaseHTTPRequestHandler):
@@ -1000,8 +1029,11 @@ def main() -> None:
                 if self.path.split("?")[0] != "/":
                     self.send_error(404)
                     return
-                body = render(collect(args.db, owned)).encode("utf-8")
-                self.send_response(200)
+                try:
+                    body, status = render(collect(args.db, owned)).encode("utf-8"), 200
+                except DbLocked as e:
+                    body, status = html.escape(str(e)).encode("utf-8"), 503
+                self.send_response(status)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -1015,7 +1047,10 @@ def main() -> None:
             webbrowser.open(f"http://localhost:{args.port}")
         HTTPServer(("127.0.0.1", args.port), H).serve_forever()
     else:
-        data = collect(args.db, owned)
+        try:
+            data = collect(args.db, owned)
+        except DbLocked as e:
+            sys.exit(str(e))
         OUT_HTML.parent.mkdir(parents=True, exist_ok=True)
         OUT_HTML.write_text(render(data), encoding="utf-8")
         print_summary(data)
