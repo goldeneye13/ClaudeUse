@@ -14,6 +14,7 @@ Usage:
     claude-use --install                 # (release exe) install into ~/.local/bin
     claude-use --uninstall               # remove it again; keeps history and settings
     claude-use --schedule-import [DAYS]  # run --import-only every DAYS days (default 1)
+    claude-use --enable-clock            # status line + toast before a session's cache expires
 
 No dependencies beyond the standard library.
 """
@@ -32,7 +33,7 @@ import tomllib
 import webbrowser
 from collections import defaultdict
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Bump in the release PR; the release build fails unless the tag is v<this>.
@@ -742,6 +743,339 @@ def unschedule_import() -> bool:
     return removed
 
 
+# Cache clock (JMR-153): Claude Code's status line shows when the session's
+# cache expires, and a Stop hook sets a one-off alarm for CLOCK_WARN_S before
+# that, replaced after every response. Nothing runs in between: the alarm is a
+# Task Scheduler task (Windows), a transient systemd timer (Linux) or a
+# sleeping process (macOS, or Linux without systemd).
+
+CLOCK_WARN_S = 600
+CLOCK_TASKS = rf"\{APP}\clock" "\\"           # Windows task folder
+CLOCK_UNIT = f"{APP}-clock"                    # systemd unit prefix
+CLOCK_PIDS = _xdg("XDG_STATE_HOME", ".local/state") / "clock"  # sleeping alarms
+CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
+# PowerShell's own app id: a toast needs a registered one, and this one always is
+PS_APP_ID = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
+
+
+def last_request(transcript: Path) -> dict | None:
+    """When the transcript's last API response was, its model and its context size."""
+    try:
+        with transcript.open("rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            chunk = 1 << 18
+            while True:  # read backwards from the end; transcripts run to MBs
+                start = max(0, size - chunk)
+                fh.seek(start)
+                lines = fh.read(size - start).splitlines()
+                for line in reversed(lines[1:] if start else lines):  # [0] may be cut
+                    if b'"type":"assistant"' not in line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue
+                    msg = e.get("message") or {}
+                    u, model = msg.get("usage"), msg.get("model", "")
+                    if not u or not model or model == "<synthetic>" or not e.get("timestamp"):
+                        continue
+                    return {"t": datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00")),
+                            "model": model, "speed": u.get("speed", "standard"),
+                            "cwd": e.get("cwd") or "",
+                            "ctx": sum(u.get(k, 0) for k in ("input_tokens", "cache_read_input_tokens",
+                                                             "cache_creation_input_tokens"))}
+                if start == 0:
+                    return None
+                chunk *= 4
+    except OSError:
+        return None
+
+
+def _hook_input() -> tuple[str, Path] | None:
+    """(session_id, transcript_path) from the JSON Claude Code pipes to a hook."""
+    try:
+        info = json.load(sys.stdin)
+    except ValueError:
+        return None
+    sid, tp = info.get("session_id") or "", info.get("transcript_path") or ""
+    # the id becomes a task / unit / file name
+    return (sid, Path(tp)) if re.fullmatch(r"[\w-]+", sid) and tp else None
+
+
+def statusline() -> None:
+    """Status line: the expiry as a clock time, right even if it isn't redrawn while idle."""
+    try:
+        info = json.load(sys.stdin)
+    except ValueError:
+        return
+    last = last_request(Path(info.get("transcript_path") or "."))
+    if not last:
+        return
+    exp = (last["t"] + timedelta(seconds=CACHE_TTL_S)).astimezone()
+    word = "warm until" if datetime.now(timezone.utc) < exp else "expired at"
+    print(f"cache {word} {exp:%H:%M}")
+
+
+def arm_clock() -> None:
+    """Stop hook: replace this session's alarm with one CLOCK_WARN_S before expiry."""
+    hook = _hook_input()
+    if not hook:
+        return
+    sid, transcript = hook
+    last = last_request(transcript)
+    cancel_clock(sid)
+    if not last:
+        return
+    delay = (last["t"] + timedelta(seconds=CACHE_TTL_S - CLOCK_WARN_S)
+             - datetime.now(timezone.utc)).total_seconds()
+    if delay > 0:
+        _set_alarm(sid, transcript, delay)
+
+
+def _clock_args(sid: str, transcript: Path) -> list[str]:
+    return [str(INSTALLED_EXE), "--clock-fire", sid, str(transcript)]
+
+
+def _set_alarm(sid: str, transcript: Path, delay: float) -> None:
+    import subprocess
+
+    if sys.platform == "win32":
+        import tempfile
+        from xml.sax.saxutils import escape
+
+        start = datetime.now() + timedelta(seconds=delay)
+        args = " ".join(f'"{a}"' if " " in a else a for a in _clock_args(sid, transcript)[1:])
+        # EndBoundary + DeleteExpiredTaskAfter: Windows tidies it up even if
+        # it never fires (PC asleep); --clock-fire also deletes it when done
+        xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>{start:%Y-%m-%dT%H:%M:%S}</StartBoundary>
+      <EndBoundary>{start + timedelta(seconds=CLOCK_WARN_S):%Y-%m-%dT%H:%M:%S}</EndBoundary>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <DeleteExpiredTaskAfter>PT0S</DeleteExpiredTaskAfter>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>conhost.exe</Command>
+      <Arguments>--headless "{escape(str(INSTALLED_EXE))}" {escape(args)}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"""
+        # schtasks + a file, not Register-ScheduledTask: this runs after every
+        # response, and loading the PowerShell module takes seconds
+        with tempfile.NamedTemporaryFile("w", encoding="utf-16", suffix=".xml",
+                                         delete=False) as f:
+            f.write(xml)
+        try:
+            subprocess.run(["schtasks", "/create", "/tn", CLOCK_TASKS + sid, "/xml", f.name, "/f"],
+                           capture_output=True, check=True)
+        finally:
+            os.unlink(f.name)
+    elif sys.platform.startswith("linux") and _has_systemd_user():
+        subprocess.run(["systemd-run", "--user", "--collect", "--quiet",
+                        f"--unit={CLOCK_UNIT}-{sid}", f"--on-active={int(delay)}s",
+                        "--timer-property=AccuracySec=5s", *_clock_args(sid, transcript)],
+                       capture_output=True, check=True)
+    else:
+        CLOCK_PIDS.mkdir(parents=True, exist_ok=True)
+        p = subprocess.Popen([*_clock_args(sid, transcript), "--clock-delay", str(int(delay))],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        (CLOCK_PIDS / f"{sid}.pid").write_text(str(p.pid))
+
+
+def cancel_clock(sid: str) -> None:
+    import subprocess
+
+    if sys.platform == "win32":
+        subprocess.run(["schtasks", "/delete", "/tn", CLOCK_TASKS + sid, "/f"], capture_output=True)
+    elif sys.platform.startswith("linux") and shutil.which("systemctl"):
+        subprocess.run(["systemctl", "--user", "stop", f"{CLOCK_UNIT}-{sid}.timer"],
+                       capture_output=True)
+    pid_file = CLOCK_PIDS / f"{sid}.pid"
+    if pid_file.exists():
+        import signal
+
+        try:
+            os.kill(int(pid_file.read_text()), signal.SIGTERM)
+        except (OSError, ValueError):  # already gone
+            pass
+        pid_file.unlink(missing_ok=True)
+
+
+def notify(title: str, body: str) -> None:
+    import subprocess
+
+    if sys.platform == "win32":
+        from xml.sax.saxutils import escape
+
+        # scenario="reminder": stays on screen until dismissed (a plain toast's
+        # banner is gone in ~5 s) and can show through Do not disturb; it needs
+        # at least one button to do that
+        toast = ('<toast scenario="reminder"><visual><binding template="ToastGeneric">'
+                 f"<text>{escape(title)}</text><text>{escape(body)}</text></binding></visual>"
+                 '<actions><action content="Dismiss" arguments="dismiss" activationType="system"/>'
+                 '</actions><audio src="ms-winsoundevent:Notification.Reminder"/></toast>')
+        # XML in through an env var, so no PowerShell quoting to get wrong
+        script = (
+            "$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications,"
+            " ContentType = WindowsRuntime];"
+            " $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument,"
+            " ContentType = WindowsRuntime];"
+            " $x = New-Object Windows.Data.Xml.Dom.XmlDocument; $x.LoadXml($env:CU_TOAST);"
+            " [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:CU_APP)"
+            ".Show([Windows.UI.Notifications.ToastNotification]::new($x))")
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                       env={**os.environ, "CU_TOAST": toast, "CU_APP": PS_APP_ID},
+                       capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+    elif sys.platform == "darwin":
+        subprocess.run(["osascript", "-e", 'display notification (system attribute "CU_BODY")'
+                        ' with title (system attribute "CU_TITLE")'],
+                       env={**os.environ, "CU_TITLE": title, "CU_BODY": body}, capture_output=True)
+    elif shutil.which("notify-send") and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        subprocess.run(["notify-send", "--app-name=Claude Use", title, body], capture_output=True)
+    # no desktop: nowhere to show it; the status line still has the time
+
+
+def clock_fire(sid: str, transcript: Path, delay: int) -> None:
+    """The alarm: warn if the session is still idle and its cache about to expire."""
+    import subprocess
+    import time
+
+    if delay:  # sleeping-process alarm
+        time.sleep(delay)
+    try:
+        last = last_request(transcript)
+        if not last:
+            return
+        exp = last["t"] + timedelta(seconds=CACHE_TTL_S)
+        left = (exp - datetime.now(timezone.utc)).total_seconds()
+        # used since (left is bigger: a newer alarm covers it), or already
+        # expired (woke from sleep): either way a warning would be wrong
+        if not 0 < left <= CLOCK_WARN_S + 60:
+            return
+        rin, _, _ = rates_for(last["model"], last["speed"])
+        cost = last["ctx"] * rin * CACHE_W1 / 1e6
+        idle = round((datetime.now(timezone.utc) - last["t"]).total_seconds() / 60)
+        notify(f"Claude Code cache expires at {exp.astimezone():%H:%M}",
+               f"{short_path(last['cwd']) or 'A session'}: idle {idle} min. Coming back after that"
+               f" rebuilds {last['ctx'] / 1000:,.0f}K tokens, about ${cost:.2f}.")
+    finally:
+        if sys.platform == "win32":
+            subprocess.run(["schtasks", "/delete", "/tn", CLOCK_TASKS + sid, "/f"],
+                           capture_output=True)
+        pid_file = CLOCK_PIDS / f"{sid}.pid"
+        if delay and pid_file.exists() and pid_file.read_text() == str(os.getpid()):
+            pid_file.unlink(missing_ok=True)
+
+
+# The clock's entries in ~/.claude/settings.json, found by the flags they
+# run so --disable-clock never touches anything else.
+
+CLOCK_FLAGS = ("--statusline", "--arm-clock", "--cancel-clock")
+
+
+def _clock_cmd(flag: str) -> str:
+    # hooks run in Git Bash on Windows: forward slashes, quoted
+    return f'"{INSTALLED_EXE.as_posix()}" {flag}'
+
+
+def _is_clock_cmd(cmd: str) -> bool:
+    return APP in cmd and any(cmd.endswith(f) for f in CLOCK_FLAGS)
+
+
+def _load_claude_settings() -> dict:
+    if not CLAUDE_SETTINGS.exists():
+        return {}
+    try:
+        return json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8"))
+    except ValueError as e:
+        sys.exit(f"{CLAUDE_SETTINGS}: {e}; fix it first, nothing changed")
+
+
+def _save_claude_settings(s: dict) -> None:
+    CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CLAUDE_SETTINGS.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(s, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, CLAUDE_SETTINGS)  # Claude Code watches this file: never half-written
+
+
+def _without_clock_hooks(groups: list) -> list:
+    return [g for g in groups
+            if not any(_is_clock_cmd(h.get("command", "")) for h in g.get("hooks", []))]
+
+
+def enable_clock() -> None:
+    if not INSTALLED_EXE.exists():
+        sys.exit(f"{INSTALLED_EXE} not found: run claude-use --install first.")
+    s = _load_claude_settings()
+    current = (s.get("statusLine") or {}).get("command", "")
+    if current and not _is_clock_cmd(current):
+        sys.exit(f"{CLAUDE_SETTINGS} already has a status line ({current}).\n"
+                 "Remove it there first if you want the cache clock instead; nothing changed.")
+    s["statusLine"] = {"type": "command", "command": _clock_cmd("--statusline"), "padding": 0}
+    hooks = s.setdefault("hooks", {})
+    # async: Claude Code doesn't wait for the alarm to be set before the next prompt
+    for event, flag, opts in (("Stop", "--arm-clock", {"async": True, "timeout": 30}),
+                              ("SessionEnd", "--cancel-clock", {"timeout": 30})):
+        hooks[event] = _without_clock_hooks(hooks.get(event, [])) + [
+            {"hooks": [{"type": "command", "command": _clock_cmd(flag), **opts}]}]
+    _save_claude_settings(s)
+    print(f"Cache clock on in {CLAUDE_SETTINGS}:\n"
+          f"  status line: cache warm until HH:MM\n"
+          f"  toast {CLOCK_WARN_S // 60} min before a session's cache expires\n"
+          "New Claude Code sessions pick it up; running ones may ask you to review the hooks (/hooks).")
+
+
+def disable_clock() -> bool:
+    """Remove the clock's settings entries and pending alarms. True if there were any."""
+    import subprocess
+
+    s = _load_claude_settings()
+    found = False
+    if _is_clock_cmd((s.get("statusLine") or {}).get("command", "")):
+        del s["statusLine"]
+        found = True
+    hooks = s.get("hooks") or {}
+    for event in ("Stop", "SessionEnd"):
+        if event in hooks:
+            kept = _without_clock_hooks(hooks[event])
+            found |= len(kept) != len(hooks[event])
+            if kept:
+                hooks[event] = kept
+            else:
+                del hooks[event]
+    if found:
+        _save_claude_settings(s)
+        print(f"Removed the cache clock from {CLAUDE_SETTINGS}")
+
+    if sys.platform == "win32":
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                        "Get-ScheduledTask -TaskPath $env:CU_DIR -ErrorAction SilentlyContinue"
+                        " | Unregister-ScheduledTask -Confirm:$false"],
+                       env={**os.environ, "CU_DIR": CLOCK_TASKS}, capture_output=True)
+    elif sys.platform.startswith("linux") and shutil.which("systemctl"):
+        subprocess.run(["systemctl", "--user", "stop", f"{CLOCK_UNIT}-*.timer"], capture_output=True)
+    if CLOCK_PIDS.is_dir():
+        for f in CLOCK_PIDS.glob("*.pid"):
+            cancel_clock(f.stem)
+    return found
+
+
 def uninstall() -> None:
     remove_entry_points()
     if OUT_HTML.parent.exists():
@@ -749,6 +1083,7 @@ def uninstall() -> None:
         print(f"Removed {OUT_HTML.parent}")
     remove_installed_exe()
     unschedule_import()
+    disable_clock()
     warn_scheduled_tasks()
 
     left = [d for d in (CONFIG_FILE.parent, DEFAULT_DB.parent) if d.exists()]
@@ -1017,9 +1352,42 @@ def main() -> None:
                          " days (default 1); run again to change it")
     ap.add_argument("--unschedule-import", action="store_true",
                     help="remove the job --schedule-import made")
+    ap.add_argument("--enable-clock", action="store_true",
+                    help="cache clock: add a status line with each session's cache expiry, and"
+                         f" a toast {CLOCK_WARN_S // 60} min before it, to ~/.claude/settings.json")
+    ap.add_argument("--disable-clock", action="store_true",
+                    help="remove the cache clock from ~/.claude/settings.json")
+    # run by Claude Code and by the alarm, not by hand
+    ap.add_argument("--statusline", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--arm-clock", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--cancel-clock", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--clock-fire", nargs=2, metavar=("SESSION", "TRANSCRIPT"), help=argparse.SUPPRESS)
+    ap.add_argument("--clock-delay", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--pause", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--version", action="version", version=f"claude-use {__version__}")
     args = ap.parse_args()
+
+    # hooks first: they run after every response, so skip everything else
+    if args.statusline:
+        statusline()
+        return
+    if args.arm_clock:
+        arm_clock()
+        return
+    if args.cancel_clock:
+        if hook := _hook_input():
+            cancel_clock(hook[0])
+        return
+    if args.clock_fire:
+        clock_fire(args.clock_fire[0], Path(args.clock_fire[1]), args.clock_delay)
+        return
+    if args.enable_clock:
+        enable_clock()
+        return
+    if args.disable_clock:
+        if not disable_clock():
+            print("The cache clock isn't on.")
+        return
 
     if args.data_dir and not args.install:
         ap.error("--data-dir only works with --install")
