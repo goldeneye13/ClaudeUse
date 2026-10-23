@@ -45,7 +45,8 @@ removes the executable, the shortcuts and `~/.cache/claude-use`, and prints what
 it leaves behind for you to delete by hand if you're done with them: your settings
 (`~/.config/claude-use`), the history DB (`~/.local/share/claude-use`) and the
 backup copy. It removes the job `--schedule-import` made (see
-[Scheduled import](#scheduled-import-optional)), and warns about any other
+[Scheduled import](#scheduled-import-optional)) and the
+[cache clock](#cache-clock-optional), and warns about any other
 scheduled task that still runs `claude-use`, but doesn't remove it.
 
 The installed `claude-use` takes the same options as the script below.
@@ -188,6 +189,36 @@ the transcript):
 | session start / subagent start | the first request of a transcript |
 | other | no gap or known event |
 | unknown | imported before causes were tracked, transcript since deleted |
+
+### Cache clock (optional)
+
+To see the clock while you work, and get warned before it runs out:
+
+```powershell
+claude-use --enable-clock     # adds it to ~/.claude/settings.json
+claude-use --disable-clock    # removes it
+```
+
+That adds, at the user level so it covers every project:
+
+- a **status line**: `cache warm until 15:32`, the current session's expiry as a
+  clock time, so it stays right while idle even though Claude Code doesn't redraw
+  it. Once the time has passed it reads `cache expired at 15:32`.
+- a **`Stop` hook** that, after every response, replaces that session's one-off
+  alarm with one set for 10 minutes before expiry. If you haven't used the session
+  when it fires, you get a notification with the project, the expiry time and
+  about what a rebuild would cost. If you have, it stays quiet.
+- a **`SessionEnd` hook** that cancels the alarm when you close the session.
+
+Nothing runs between responses. The alarm is a one-off Task Scheduler task under
+`\claude-use\clock\` (Windows), a transient systemd user timer (Linux), or a
+sleeping process (macOS, or Linux without systemd). Notifications come from
+PowerShell on Windows, `notify-send` on Linux (skipped with no desktop) and
+`osascript` on macOS (credited to Script Editor; it asks for permission once).
+The Linux and macOS paths are untested.
+
+It needs the installed executable and won't replace a status line you already
+have. Your other hooks are left alone, and `--uninstall` removes it too.
 
 ## How costs are computed
 
