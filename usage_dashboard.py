@@ -564,7 +564,18 @@ def _cleanup_period_days() -> int:
 
 
 def _systemd_dir() -> Path:
-    return _xdg_base("XDG_CONFIG_HOME", ".config") / "systemd" / "user"
+    """Where the user manager looks for units: its own XDG_CONFIG_HOME, which
+    needn't match this process's (set in a shell profile, say), else ~/.config."""
+    import subprocess
+
+    base = Path.home() / ".config"
+    if shutil.which("systemctl"):
+        out = subprocess.run(["systemctl", "--user", "show-environment"],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            if line.startswith("XDG_CONFIG_HOME=") and Path(line[16:]).is_absolute():
+                base = Path(line[16:])
+    return base / "systemd" / "user"
 
 
 def _launchd_plist() -> Path:

@@ -82,8 +82,9 @@ jobs:
               MSYS_NO_PATHCONV=1 schtasks /query /tn "claude-use import" ;;
             Linux)
               cat "$XDG_DATA_HOME/applications/claude-use.desktop"
-              if [ -f "$XDG_CONFIG_HOME/systemd/user/claude-use-import.timer" ]; then
-                cat "$XDG_CONFIG_HOME/systemd/user/claude-use-import.timer"
+              if systemctl --user show-environment > /dev/null 2>&1; then
+                systemctl --user cat claude-use-import.timer
+                systemctl --user is-enabled claude-use-import.timer
               else
                 test "$(crontab -l | grep -c 'claude-use import')" = 1
               fi ;;
@@ -138,7 +139,7 @@ jobs:
               if MSYS_NO_PATHCONV=1 schtasks /query /tn "claude-use import"; then exit 1; fi ;;
             Linux)
               test ! -e "$XDG_DATA_HOME/applications/claude-use.desktop"
-              test ! -e "$XDG_CONFIG_HOME/systemd/user/claude-use-import.timer"
+              if systemctl --user cat claude-use-import.timer 2>/dev/null; then exit 1; fi
               if crontab -l 2>/dev/null | grep -q claude-use; then exit 1; fi ;;
             macOS)
               test ! -e ~/Library/LaunchAgents/claude-use-import.plist ;;
