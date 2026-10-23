@@ -77,6 +77,7 @@
   }
   .card h2 { font-size: 14px; font-weight: 650; margin: 0 0 2px; }
   .card .desc { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  .card h3 { font-size: 13px; font-weight: 600; margin: 18px 0 2px; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 800px) { .grid2 { grid-template-columns: 1fr; } }
 
@@ -156,6 +157,22 @@
     <div class="tiles compact" id="refireTiles"></div>
     <div id="refireChart"></div>
     <div class="scroll-x" id="refireTable"></div>
+    <div id="refireProj">
+      <h3 id="refireProjTitle"></h3>
+      <div class="desc" id="refireProjDesc"></div>
+      <div id="refireProjChart"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Breaks and the cache clock</h2>
+    <div class="desc" id="gapDesc"></div>
+    <div class="tiles compact" id="gapTiles"></div>
+    <div id="gapChart"></div>
+    <div class="legend" id="gapLegend"></div>
+    <h3 id="closeTitle"></h3>
+    <div class="desc" id="closeDesc"></div>
+    <div id="closeChart"></div>
   </div>
 
   <div class="grid2">
@@ -221,11 +238,13 @@ const dayLabel = (iso) => {
   const d = new Date(iso + "T12:00:00");
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
 };
-function niceTicks(max) {
+// whole = counts: never a step below 1
+function niceTicks(max, whole) {
   if (max <= 0) return [0, 1];
   const raw = max / 4;
   const mag = Math.pow(10, Math.floor(Math.log10(raw)));
-  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw);
+  let step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw);
+  if (whole) step = Math.max(1, Math.ceil(step));
   const ticks = [];
   for (let v = 0; v <= max + 1e-9; v += step) ticks.push(+v.toFixed(6));
   if (ticks[ticks.length - 1] < max) ticks.push(ticks[ticks.length - 1] + step);
@@ -469,15 +488,17 @@ function renderTime(recs) {
 
 // vertical stacked columns with axes and per-column hover; false if nothing to draw.
 // stacks[i] = [{v, light, hatch, name, ...}] bottom to top
+// o.fmt overrides the value format; o.marker = {at, label} draws a dashed
+// line on the left edge of column `at`
 function drawColumns(host, cols, stacks, o) {
   host.textContent = "";
-  const fmtV = o.tokens ? fmtTok : fmt$;
+  const fmtV = o.fmt || (o.tokens ? fmtTok : fmt$);
   const totals = stacks.map(s => s.reduce((a, g) => a + g.v, 0));
   if (!totals.some(t => t > 0)) {
     host.appendChild(el("div", "desc", o.empty));
     return false;
   }
-  const ticks = niceTicks(Math.max(...totals));
+  const ticks = niceTicks(Math.max(...totals), o.fmt === fmtCount);
   const maxY = ticks[ticks.length - 1];
 
   const W = Math.max(560, host.clientWidth || 900), H = o.height || 240;
@@ -504,9 +525,24 @@ function drawColumns(host, cols, stacks, o) {
       tx.setAttribute("x", M.l - 6); tx.setAttribute("y", y(t) + 4);
       tx.setAttribute("text-anchor", "end");
       tx.setAttribute("class", "tick");
-      tx.textContent = o.tokens ? fmtTok(t) : "$" + (t >= 1 ? Math.round(t) : t);
+      tx.textContent = o.fmt ? o.fmt(t) : o.tokens ? fmtTok(t) : "$" + (t >= 1 ? Math.round(t) : t);
       svg.appendChild(tx);
     }
+  }
+
+  if (o.marker) {
+    const mx = M.l + band * o.marker.at;
+    const ln = svgEl("line");
+    ln.setAttribute("x1", mx); ln.setAttribute("x2", mx);
+    ln.setAttribute("y1", M.t); ln.setAttribute("y2", M.t + ih);
+    ln.setAttribute("stroke", "var(--ink-2)");
+    ln.setAttribute("stroke-dasharray", "4 3");
+    svg.appendChild(ln);
+    const tx = svgEl("text");
+    tx.setAttribute("x", mx + 5); tx.setAttribute("y", M.t + 11);
+    tx.setAttribute("class", "cat");
+    tx.textContent = o.marker.label;
+    svg.appendChild(tx);
   }
 
   const every = Math.ceil(cols.length / Math.floor(iw / 56));
@@ -626,6 +662,27 @@ function renderRefires(recs) {
     totalName: tokens ? "tokens rebuilt" : "extra cost",
   });
 
+  // per project: where the rebuilds come from
+  $("#refireProj").style.display = evs.length ? "" : "none";
+  $("#refireProjTitle").textContent = "Refires by project";
+  $("#refireProjDesc").textContent = (tokens ? "Tokens rebuilt" : "Extra cost") +
+    " per project; the tooltip has the count and the most common cause";
+  const byProj = {};
+  for (const e of evs) (byProj[e.p] || (byProj[e.p] = [])).push(e);
+  const projItems = Object.entries(byProj).map(([p, es]) => {
+    const counts = {};
+    for (const e of es) counts[e.cause] = (counts[e.cause] || 0) + 1;
+    const top = Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
+    const v = sum(es, val);
+    return {
+      name: p, segs: [{ v, light: true, hatch: true }], total: v,
+      detail: [["refires", `${es.length}×`, "none"], ["tokens rebuilt", fmtTok(sum(es, e => e.tok)), "hatch"],
+               ["extra cost", fmt$(sum(es, e => e.extra)), "none"],
+               [`mostly ${top}`, `${counts[top]}×`, "none"]],
+    };
+  }).sort((a, b) => b.total - a.total);
+  renderHBars("#refireProjChart", projItems, () => "var(--ink-2)", "Refires by project");
+
   // cause table
   const host = $("#refireTable");
   host.textContent = "";
@@ -651,6 +708,87 @@ function renderRefires(recs) {
   }
   tbl.appendChild(tbody);
   host.appendChild(tbl);
+}
+
+/* ---------- breaks and close calls (JMR-149) ---------- */
+const fmtCount = (v) => fmtInt(v);
+
+function renderGaps() {
+  const hourly = state.range === "today", tokens = state.metric === "tokens";
+  const lo = rangeStart(), ttl = DATA.cacheTtlMin, cc = DATA.closeCallMin;
+  const gaps = DATA.gaps.filter(g => g.d >= lo && g.d <= TODAY);
+  const calls = DATA.closeCalls.filter(e => e.d >= lo && e.d <= TODAY);
+  const past = (g) => g.b >= DATA.gapTtlBucket;
+
+  $("#gapDesc").textContent =
+    "How long you were away before coming back to a session, for breaks of 5 minutes or more. " +
+    `The cache lasts ${ttl} minutes after the last request (dashed line). Striped: the return rebuilt ` +
+    "the whole context. Past the line, the rest had a context too small to count as a refire.";
+
+  const box = $("#gapTiles");
+  box.textContent = "";
+  const mk = (label, value, note) => {
+    const t = el("div", "tile");
+    t.appendChild(el("div", "label", label));
+    t.appendChild(el("div", "value", value));
+    if (note) t.appendChild(el("div", "note", note));
+    box.appendChild(t);
+  };
+  const breaks = sum(gaps, g => g.n), late = sum(gaps.filter(past), g => g.n);
+  const lateRebuilt = sum(gaps.filter(g => past(g) && g.rebuilt), g => g.n);
+  const saved = sum(calls, e => tokens ? e.tok : e.saved);
+  mk("Breaks", fmtInt(breaks), "5 min or more between requests");
+  mk("Back in time", fmtInt(breaks - late), `within ${ttl} min, cache still there`);
+  mk("Back too late", fmtInt(late), `${fmtInt(lateRebuilt)} rebuilt the context`);
+  mk("Close calls", fmtInt(calls.length),
+     `back ${cc}–${ttl} min later; ${tokens ? fmtTok(saved) + " tokens" : fmt$(saved)} not rebuilt`);
+
+  // histogram: one column per bucket, plain then striped
+  const cols = DATA.gapLabels.map((label, i) => ({ label, title: `Away ${label}`, i }));
+  const stacks = cols.map(c => {
+    const at = gaps.filter(g => g.b === c.i);
+    const kept = sum(at.filter(g => !g.rebuilt), g => g.n), rebuilt = sum(at.filter(g => g.rebuilt), g => g.n);
+    const segs = [];
+    if (kept > 0) segs.push({ v: kept, name: "no rebuild" });
+    if (rebuilt > 0) segs.push({ v: rebuilt, light: true, hatch: true, name: "context rebuilt" });
+    return segs;
+  });
+  const drawn = drawColumns($("#gapChart"), cols, stacks, {
+    fmt: fmtCount, height: 180, aria: "Breaks by length, with the cache expiry marked",
+    empty: hourly ? "No breaks today." : "No breaks in this range.",
+    marker: { at: DATA.gapTtlBucket, label: `cache expires (${ttl} min)` },
+    color: (g) => g.hatch ? "var(--ink-2)" : "var(--accent)",
+    extraRows: () => [], totalName: "returns",
+  });
+  const leg = $("#gapLegend");
+  leg.textContent = "";
+  if (drawn) {
+    for (const [color, label, hatch] of [["var(--accent)", "no rebuild"],
+                                         ["var(--ink-2)", "context rebuilt", true]]) {
+      const it = el("span", "item"), sw = el("span", "sw");
+      sw.style.background = hatch ? `${HATCH_CSS}, ${color}` : color;
+      if (hatch) sw.style.opacity = INPUT_OPACITY;
+      it.appendChild(sw);
+      it.appendChild(el("span", null, label));
+      leg.appendChild(it);
+    }
+  }
+
+  // close calls over time, each one listed in the tooltip
+  $("#closeTitle").textContent = `Close calls per ${hourly ? "hour" : "day"}`;
+  $("#closeDesc").textContent =
+    `Back ${cc} to ${ttl} minutes after the previous request, with the cache still warm`;
+  const ccols = timeColumns(calls, calls.filter(e => e.d === TODAY));
+  drawColumns($("#closeChart"), ccols,
+    ccols.map(c => c.recs.length ? [{ v: c.recs.length, name: "close calls" }] : []), {
+      fmt: fmtCount, height: 120, aria: `Close calls per ${hourly ? "hour" : "day"}`,
+      empty: hourly ? "No close calls today." : "No close calls in this range.",
+      color: () => "var(--accent)",
+      extraRows: (c) => c.recs.slice(0, 6).map(e => ({
+        value: `${Math.round(e.gap / 60)} min`,
+        name: `${e.p}: ${tokens ? fmtTok(e.tok) + " tokens" : fmt$(e.saved)} not rebuilt` })),
+      totalName: "close calls",
+    });
 }
 
 /* ---------- horizontal bar charts ---------- */
@@ -779,6 +917,7 @@ function render() {
   renderTiles(recs);
   renderTime(recs);
   renderRefires(recs);
+  renderGaps();
 
   // the Show switch scopes these too: cost, or new input + output like the time chart
   const tokens = state.metric === "tokens";
