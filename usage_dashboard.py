@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Bump in the release PR; the release build fails unless the tag is v<this>.
-__version__ = "2.2.1"
+__version__ = "3.0.0"
 
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 # template.html is bundled inside a PyInstaller build, so this works frozen too.
