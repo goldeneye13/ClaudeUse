@@ -253,4 +253,8 @@ selected range — edit `SUBSCRIPTION_MONTHLY` / `SUBSCRIPTION_NAME` at the top 
 
 - `usage_dashboard.py` — parser, SQLite history, pricing, CLI, tiny HTTP server, installer
 - `template.html` — dashboard template (data injected at `/*__DATA__*/`)
+- `assets/` — the app icon: `make_icon.py` holds its geometry and writes `icon.svg`,
+  `icon.ico` (built into the Windows exe), `icon.png` (the Linux launcher's) and the
+  dashboard's inline favicon. Run it by hand when the icon changes (needs Pillow,
+  which the app itself doesn't), and commit what it writes.
 - `~/.cache/claude-use/dashboard.html` — generated output (safe to delete/regenerate)

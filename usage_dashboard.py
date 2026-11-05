@@ -411,6 +411,16 @@ def _desktop_file() -> Path:
     return _xdg_base("XDG_DATA_HOME", ".local/share") / "applications" / f"{APP}.desktop"
 
 
+# assets/icon.png is bundled in the release build like template.html (JMR-159);
+# on Windows the icon is built into the exe itself
+ICON_PNG = Path(__file__).parent / "assets" / "icon.png"
+
+
+def _linux_icon() -> Path:
+    return (_xdg_base("XDG_DATA_HOME", ".local/share") / "icons" / "hicolor" / "256x256"
+            / "apps" / f"{APP}.png")
+
+
 def _running_installed() -> bool:
     return (getattr(sys, "frozen", False)
             and Path(sys.executable).resolve() == INSTALLED_EXE.resolve())
@@ -450,6 +460,10 @@ def create_entry_points() -> None:
         if _user_path(add=True):
             print(f"Added {BIN_DIR} to your user PATH (new terminals pick it up)")
     elif sys.platform.startswith("linux"):
+        icon = _linux_icon()
+        icon.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ICON_PNG, icon)
+        print(f"Created {icon}")
         desktop = _desktop_file()
         desktop.parent.mkdir(parents=True, exist_ok=True)
         desktop.write_text(
@@ -458,6 +472,7 @@ def create_entry_points() -> None:
             f"Name={DISPLAY_NAME}\n"
             "Comment=Claude Code usage dashboard\n"
             f'Exec="{INSTALLED_EXE}"\n'
+            f"Icon={APP}\n"
             "Terminal=false\n"
             "Categories=Utility;Development;\n"
             "Actions=uninstall;\n"
@@ -486,10 +501,10 @@ def remove_entry_points() -> None:
         if _user_path(add=False):
             print(f"Removed {BIN_DIR} from your user PATH")
     elif sys.platform.startswith("linux"):
-        desktop = _desktop_file()
-        if desktop.exists():
-            desktop.unlink()
-            print(f"Removed {desktop}")
+        for f in (_desktop_file(), _linux_icon()):
+            if f.exists():
+                f.unlink()
+                print(f"Removed {f}")
 
 
 def _user_path(add: bool) -> bool:

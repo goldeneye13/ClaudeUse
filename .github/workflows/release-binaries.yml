@@ -49,7 +49,11 @@ jobs:
       - run: pip install pyinstaller
 
       - name: Build
-        run: pyinstaller --onefile --name claude-use --add-data "template.html:." usage_dashboard.py
+        # the icon is built into the Windows exe; Linux --install copies the PNG out
+        run: |
+          icon=(); [ "$RUNNER_OS" = Windows ] && icon=(--icon assets/icon.ico)
+          pyinstaller --onefile --name claude-use "${icon[@]}" --add-data "template.html:." \
+            --add-data "assets/icon.png:assets" usage_dashboard.py
 
       # a release must print its own tag, or --version is lying
       - name: Check version
@@ -101,7 +105,9 @@ jobs:
               # on the user PATH once, though installed twice
               test "$(MSYS_NO_PATHCONV=1 reg query 'HKCU\Environment' /v Path | grep -o -F 'Programs\claude-use' | wc -l)" = 1 ;;
             Linux)
-              cat "$XDG_DATA_HOME/applications/claude-use.desktop" ;;
+              cat "$XDG_DATA_HOME/applications/claude-use.desktop"
+              grep -qx 'Icon=claude-use' "$XDG_DATA_HOME/applications/claude-use.desktop"
+              cmp assets/icon.png "$XDG_DATA_HOME/icons/hicolor/256x256/apps/claude-use.png" ;;
           esac
 
       # the hook as Claude Code runs it: a new transcript must land in the DB,
@@ -139,7 +145,8 @@ jobs:
               if reg query 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\claude-use'; then exit 1; fi
               if MSYS_NO_PATHCONV=1 reg query 'HKCU\Environment' /v Path | grep -q -F 'Programs\claude-use'; then exit 1; fi ;;
             Linux)
-              test ! -e "$XDG_DATA_HOME/applications/claude-use.desktop" ;;
+              test ! -e "$XDG_DATA_HOME/applications/claude-use.desktop"
+              test ! -e "$XDG_DATA_HOME/icons/hicolor/256x256/apps/claude-use.png" ;;
           esac
 
       # tar keeps the executable bit, which a bare download would lose
