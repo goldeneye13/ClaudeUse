@@ -13,7 +13,7 @@ Usage:
     python usage_dashboard.py --import-only  # just update the history DB
     claude-use --install [--all]         # (release exe) install it; --all adds the status line
     claude-use --uninstall               # remove it again; keeps history and settings
-    claude-use --enable-statusline       # Claude Code status line: cache expiry, daily import
+    claude-use --enable-auto-import      # import whenever a Claude Code session starts
 
 No dependencies beyond the standard library.
 """
@@ -32,7 +32,7 @@ import tomllib
 import webbrowser
 from collections import defaultdict
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Bump in the release PR; the release build fails unless the tag is v<this>.
@@ -573,7 +573,8 @@ LEGACY_UNIT = f"{APP}-import"                   # systemd units, launchd label
 LEGACY_CLOCK_TASKS = rf"\{APP}\clock" "\\"      # Windows task folder
 LEGACY_CLOCK_UNIT = f"{APP}-clock"              # transient systemd timers
 LEGACY_CLOCK_PIDS = _xdg("XDG_STATE_HOME", ".local/state") / "clock"  # sleeping alarms
-LEGACY_HOOK_FLAGS = ("--arm-clock", "--cancel-clock")
+# the cache clock's entries in ~/.claude/settings.json: status line and hooks
+LEGACY_SETTINGS_FLAGS = ("--statusline", "--arm-clock", "--cancel-clock")
 
 
 def _windows_tasks() -> list[str]:
@@ -698,107 +699,24 @@ def warn_scheduled_tasks() -> None:
             print(f"  {h}")
 
 
-# Status line (JMR-153, JMR-161). Claude Code runs it on every redraw: it
-# shows when the session's cache expires and, at most once per
-# IMPORT_EVERY_S, starts an --import-only in the background. That's the only
-# scheduler: transcripts only change while Claude Code runs, and it runs this.
+# Auto-import (JMR-161): one async SessionStart hook in ~/.claude/settings.json
+# runs the import whenever a Claude Code session starts, resumes or clears.
+# Claude Code doesn't wait for it, and an import takes seconds, so there's no
+# throttle. Our entries are found by the flag they run, so nothing else in
+# settings.json (your own status line and hooks) is ever touched.
 
 CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
-STATUSLINE_FLAG = "--statusline"
-IMPORT_EVERY_S = 86400
-IMPORT_STAMP = _xdg("XDG_STATE_HOME", ".local/state") / "last-import"
+HOOK_EVENT = "SessionStart"
+HOOK_FLAG = "--auto-import"
 
 
-def last_request(transcript: Path) -> dict | None:
-    """When the transcript's last API response was, its model and its context size."""
-    try:
-        with transcript.open("rb") as fh:
-            size = fh.seek(0, os.SEEK_END)
-            chunk = 1 << 18
-            while True:  # read backwards from the end; transcripts run to MBs
-                start = max(0, size - chunk)
-                fh.seek(start)
-                lines = fh.read(size - start).splitlines()
-                for line in reversed(lines[1:] if start else lines):  # [0] may be cut
-                    if b'"type":"assistant"' not in line:
-                        continue
-                    try:
-                        e = json.loads(line)
-                    except ValueError:
-                        continue
-                    msg = e.get("message") or {}
-                    u, model = msg.get("usage"), msg.get("model", "")
-                    if not u or not model or model == "<synthetic>" or not e.get("timestamp"):
-                        continue
-                    return {"t": datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00")),
-                            "model": model, "speed": u.get("speed", "standard"),
-                            "cwd": e.get("cwd") or "",
-                            "ctx": sum(u.get(k, 0) for k in ("input_tokens", "cache_read_input_tokens",
-                                                             "cache_creation_input_tokens"))}
-                if start == 0:
-                    return None
-                chunk *= 4
-    except OSError:
-        return None
-
-
-def stamp_import() -> None:
-    IMPORT_STAMP.parent.mkdir(parents=True, exist_ok=True)
-    IMPORT_STAMP.touch()
-
-
-def import_in_background() -> None:
-    """Start --import-only, with no window, if the last import was IMPORT_EVERY_S ago."""
-    import subprocess
-    import time
-
-    try:
-        if time.time() - IMPORT_STAMP.stat().st_mtime < IMPORT_EVERY_S:
-            return
-    except FileNotFoundError:
-        pass
-    stamp_import()  # claim it first: the next redraw is moments away
-    cmd = ([sys.executable] if getattr(sys, "frozen", False)
-           else [sys.executable, str(Path(__file__).resolve())])
-    # its own console (hidden) or session: Claude Code mustn't wait for it,
-    # and the import must outlive this status line process
-    kw = ({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32"
-          else {"start_new_session": True})
-    # a one-file build would otherwise reuse this process's unpacked files,
-    # which are deleted as soon as it exits (PyInstaller 6.9+)
-    env = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
-    subprocess.Popen([*cmd, "--import-only"], env=env, stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **kw)
-
-
-def statusline() -> None:
-    """Status line: the expiry as a clock time, right even if it isn't redrawn while idle."""
-    try:
-        import_in_background()
-    except OSError:  # never lose the status line over it
-        pass
-    try:
-        info = json.load(sys.stdin)
-    except ValueError:
-        return
-    last = last_request(Path(info.get("transcript_path") or "."))
-    if not last:
-        return
-    exp = (last["t"] + timedelta(seconds=CACHE_TTL_S)).astimezone()
-    word = "warm until" if datetime.now(timezone.utc) < exp else "expired at"
-    print(f"cache {word} {exp:%H:%M}")
-
-
-# Our entries in ~/.claude/settings.json, found by the flags they run, so
-# nothing else there is ever touched.
-
-def _our_cmd(flag: str) -> str:
+def _hook_cmd() -> str:
     # Claude Code runs it in Git Bash on Windows: forward slashes, quoted
-    return f'"{INSTALLED_EXE.as_posix()}" {flag}'
+    return f'"{INSTALLED_EXE.as_posix()}" {HOOK_FLAG}'
 
 
-def _is_ours(cmd: str) -> bool:
-    return APP in cmd and any(cmd.endswith(f) for f in (STATUSLINE_FLAG, *LEGACY_HOOK_FLAGS))
+def _is_ours(cmd: str, flags: tuple[str, ...]) -> bool:
+    return APP in cmd and any(cmd.endswith(f) for f in flags)
 
 
 def _load_claude_settings() -> dict:
@@ -817,68 +735,94 @@ def _save_claude_settings(s: dict) -> None:
     os.replace(tmp, CLAUDE_SETTINGS)  # Claude Code watches this file: never half-written
 
 
-def _strip_legacy_hooks(s: dict) -> bool:
-    """Drop the 2.x cache clock hooks (Stop, SessionEnd). True if there were any."""
-    hooks = s.get("hooks") or {}
+def _our_hooks(s: dict, flags: tuple[str, ...]) -> list[str]:
+    return [h.get("command", "") for groups in (s.get("hooks") or {}).values()
+            if isinstance(groups, list) for g in groups for h in g.get("hooks", [])
+            if _is_ours(h.get("command", ""), flags)]
+
+
+def _strip(s: dict, flags: tuple[str, ...]) -> bool:
+    """Drop our hooks and status line that run any of flags. True if there were any."""
     found = False
-    for event in ("Stop", "SessionEnd"):
-        if event in hooks:
-            kept = [g for g in hooks[event]
-                    if not any(_is_ours(h.get("command", "")) for h in g.get("hooks", []))]
-            if len(kept) != len(hooks[event]):
-                found = True
-                if kept:
-                    hooks[event] = kept
-                else:
-                    del hooks[event]
+    hooks = s.get("hooks") or {}
+    for event in list(hooks):
+        groups = hooks[event]
+        if not isinstance(groups, list):
+            continue
+        kept = [g for g in groups
+                if not any(_is_ours(h.get("command", ""), flags) for h in g.get("hooks", []))]
+        if len(kept) != len(groups):
+            found = True
+            if kept:
+                hooks[event] = kept
+            else:
+                del hooks[event]
     if found and not hooks:
         del s["hooks"]
+    if _is_ours((s.get("statusLine") or {}).get("command", ""), flags):
+        del s["statusLine"]
+        found = True
     return found
+
+
+def _add_hook(s: dict) -> None:
+    s.setdefault("hooks", {}).setdefault(HOOK_EVENT, []).append(
+        {"hooks": [{"type": "command", "command": _hook_cmd(), "async": True, "timeout": 120}]})
 
 
 def migrate_claude_settings() -> None:
-    """On install: drop the 2.x hooks, and point our status line at this install."""
+    """On install: drop the 2.x cache clock, and point our hook at this install."""
     if not CLAUDE_SETTINGS.exists():
         return
     s = _load_claude_settings()
-    changed = _strip_legacy_hooks(s)
+    changed = _strip(s, LEGACY_SETTINGS_FLAGS)
     if changed:
-        print(f"Removed the 2.x cache clock hooks from {CLAUDE_SETTINGS}")
-    line = s.get("statusLine") or {}
-    if _is_ours(line.get("command", "")) and line["command"] != _our_cmd(STATUSLINE_FLAG):
-        line["command"] = _our_cmd(STATUSLINE_FLAG)
+        print(f"Removed the 2.x cache clock from {CLAUDE_SETTINGS}")
+    if _our_hooks(s, (HOOK_FLAG,)) not in ([], [_hook_cmd()]):
+        _strip(s, (HOOK_FLAG,))
+        _add_hook(s)
         changed = True
-        print(f"Pointed the status line in {CLAUDE_SETTINGS} at {INSTALLED_EXE}")
+        print(f"Pointed the auto-import hook in {CLAUDE_SETTINGS} at {INSTALLED_EXE}")
     if changed:
         _save_claude_settings(s)
 
 
-def enable_statusline() -> None:
+def enable_auto_import() -> None:
     if not INSTALLED_EXE.exists():
         sys.exit(f"{INSTALLED_EXE} not found: run claude-use --install first.")
     s = _load_claude_settings()
-    current = (s.get("statusLine") or {}).get("command", "")
-    if current and not _is_ours(current):
-        sys.exit(f"{CLAUDE_SETTINGS} already has a status line ({current}).\n"
-                 "Remove it there first if you want this one instead; nothing changed.")
-    s["statusLine"] = {"type": "command", "command": _our_cmd(STATUSLINE_FLAG), "padding": 0}
-    _strip_legacy_hooks(s)
+    _strip(s, LEGACY_SETTINGS_FLAGS + (HOOK_FLAG,))
+    _add_hook(s)
     _save_claude_settings(s)
-    print(f"Status line on in {CLAUDE_SETTINGS}: cache warm until HH:MM.\n"
-          "It also keeps the history current: once a day it imports in the background.")
+    print(f"Auto-import on in {CLAUDE_SETTINGS}:\n"
+          f"  a {HOOK_EVENT} hook updates the history in the background"
+          " whenever a Claude Code session starts.")
 
 
-def disable_statusline() -> bool:
-    """Remove our status line, and any 2.x hooks. True if there was either."""
+def disable_auto_import() -> bool:
+    """Remove our hook, and any 2.x cache clock. True if there was either."""
     s = _load_claude_settings()
-    found = _strip_legacy_hooks(s)
-    if _is_ours((s.get("statusLine") or {}).get("command", "")):
-        del s["statusLine"]
-        found = True
-    if found:
-        _save_claude_settings(s)
-        print(f"Removed the claude-use status line from {CLAUDE_SETTINGS}")
-    return found
+    if not _strip(s, LEGACY_SETTINGS_FLAGS + (HOOK_FLAG,)):
+        return False
+    _save_claude_settings(s)
+    print(f"Removed the claude-use auto-import from {CLAUDE_SETTINGS}")
+    return True
+
+
+def auto_import() -> None:
+    """The hook itself: import, silently. Claude Code can add a SessionStart
+    hook's output to the session's context, and an error is nothing it can act on."""
+    import contextlib
+    import io
+
+    sink = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            owned = owned_snapshot()
+            seed_db(DEFAULT_DB, owned)
+            update_history(DEFAULT_DB, owned)
+    except (Exception, SystemExit):  # DB locked by a viewer, bad config: next session retries
+        pass
 
 
 def uninstall() -> None:
@@ -889,10 +833,10 @@ def uninstall() -> None:
     remove_installed_exe()
     remove_legacy_exe()
     remove_legacy_jobs()
-    disable_statusline()
-    if IMPORT_STAMP.parent.exists():  # just the last-import stamp: not data
-        shutil.rmtree(IMPORT_STAMP.parent)
-        print(f"Removed {IMPORT_STAMP.parent}")
+    disable_auto_import()
+    if LEGACY_CLOCK_PIDS.parent.exists():  # only ever held the 2.x clock's state
+        shutil.rmtree(LEGACY_CLOCK_PIDS.parent)
+        print(f"Removed {LEGACY_CLOCK_PIDS.parent}")
     warn_scheduled_tasks()
 
     left = [d for d in (CONFIG_FILE.parent, DEFAULT_DB.parent) if d.exists()]
@@ -923,7 +867,7 @@ def install(data_dir: Path | None) -> None:
             shutil.copy2(exe, target)
         except PermissionError:
             sys.exit(f"Can't replace {target}: close the running claude-use"
-                     " (and Claude Code, whose status line runs it), then install again.")
+                     " (and Claude Code, whose hook runs it), then install again.")
         print(f"Installed {target}")
 
     remove_legacy_exe()
@@ -1094,8 +1038,6 @@ def update_history(db: Path, owned: Path | None) -> None:
         import_transcripts(db)
         if owned:
             snapshot(db, owned)
-    if db == DEFAULT_DB:
-        stamp_import()
 
 
 def collect(db: Path, owned: Path | None) -> dict:
@@ -1135,18 +1077,18 @@ def print_summary(data: dict) -> None:
               f'  ->  API would cost {total / sub:,.1f}x more' if sub else "")
 
 
-def install_statusline() -> None:
-    """--install --all: the status line too. If it can't be added, the install
+def install_auto_import() -> None:
+    """--install --all: the auto-import too. If it can't be added, the install
     still stands, and the exit code says something was skipped."""
     print()
     try:
-        enable_statusline()
+        enable_auto_import()
     except (SystemExit, OSError) as e:
         if isinstance(e, SystemExit) and not e.code:
             return
         print(f"Skipped: {e.code if isinstance(e, SystemExit) else e}")
-        print("\nInstalled, but without the status line. Once fixed, run:\n"
-              "  claude-use --enable-statusline")
+        print("\nInstalled, but without the auto-import. Once fixed, run:\n"
+              "  claude-use --enable-auto-import")
         sys.exit(1)
 
 
@@ -1166,18 +1108,19 @@ def main() -> None:
     ap.add_argument("--data-dir", type=Path, metavar="PATH",
                     help="with --install: back up the history DB to this folder")
     ap.add_argument("--all", action="store_true",
-                    help="with --install: also --enable-statusline")
+                    help="with --install: also --enable-auto-import")
     ap.add_argument("--uninstall", action="store_true",
-                    help="remove the installed executable, its shortcuts and its status"
-                         " line; keeps settings, history and backup")
-    ap.add_argument("--enable-statusline", action="store_true",
-                    help="add a Claude Code status line with the session's cache expiry,"
-                         " which also imports once a day, to ~/.claude/settings.json")
-    ap.add_argument("--disable-statusline", action="store_true",
-                    help="remove that status line from ~/.claude/settings.json")
+                    help="remove the installed executable, its shortcuts and its"
+                         " auto-import; keeps settings, history and backup")
+    ap.add_argument("--enable-auto-import", action="store_true",
+                    help="add a SessionStart hook to ~/.claude/settings.json that"
+                         " imports in the background whenever a Claude Code session starts")
+    ap.add_argument("--disable-auto-import", action="store_true",
+                    help="remove that hook")
     # run by Claude Code, not by hand
+    ap.add_argument(HOOK_FLAG, action="store_true", help=argparse.SUPPRESS)
+    # 2.x status line, hooks and alarms that --install hasn't removed yet: ignored
     ap.add_argument("--statusline", action="store_true", help=argparse.SUPPRESS)
-    # 2.x hooks and alarms that --install hasn't removed yet: accepted, ignored
     ap.add_argument("--arm-clock", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--cancel-clock", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--clock-fire", nargs=2, help=argparse.SUPPRESS)
@@ -1186,15 +1129,15 @@ def main() -> None:
     ap.add_argument("--version", action="version", version=f"claude-use {__version__}")
     args = ap.parse_args()
 
-    # the status line first: it runs on every redraw, so skip everything else
-    if args.statusline:
-        statusline()
+    # the hook first: it runs on every session start, so skip everything else
+    if args.auto_import:
+        auto_import()
         return
-    if args.arm_clock or args.cancel_clock or args.clock_fire:
+    if args.statusline or args.arm_clock or args.cancel_clock or args.clock_fire:
         return
-    if args.disable_statusline:
-        if not disable_statusline():
-            print("The claude-use status line isn't on.")
+    if args.disable_auto_import:
+        if not disable_auto_import():
+            print("The claude-use auto-import isn't on.")
         return
 
     for flag in ("data_dir", "all"):
@@ -1202,11 +1145,11 @@ def main() -> None:
             ap.error(f"--{flag.replace('_', '-')} only works with --install")
     if args.install:
         install(args.data_dir.expanduser().absolute() if args.data_dir else None)
-        if args.enable_statusline or args.all:
-            install_statusline()
+        if args.enable_auto_import or args.all:
+            install_auto_import()
         return
-    if args.enable_statusline:
-        enable_statusline()
+    if args.enable_auto_import:
+        enable_auto_import()
         return
     if args.uninstall:
         uninstall()

@@ -75,9 +75,9 @@ jobs:
       - name: Smoke test install
         run: |
           mkdir -p ~/.claude/projects
-          # 2.x leftovers that --install must remove: a clock hook and, on
-          # Windows, the import task and the exe in its old place
-          echo '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"\"/old/claude-use\" --arm-clock"}]}]}}' > ~/.claude/settings.json
+          # 2.x leftovers that --install must remove: the clock's status line
+          # and hook and, on Windows, the import task and the exe in its old place
+          echo '{"statusLine":{"type":"command","command":"\"/old/claude-use\" --statusline"},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"\"/old/claude-use\" --arm-clock"}]}]}}' > ~/.claude/settings.json
           if [ "$RUNNER_OS" = Windows ]; then
             MSYS_NO_PATHCONV=1 schtasks /create /tn "claude-use import" /tr "cmd /c exit" /sc daily /st 12:00 /f
             mkdir -p ~/.local/bin && cp dist/claude-use.exe ~/.local/bin/
@@ -88,8 +88,10 @@ jobs:
           "$EXE" --no-open
           test -s "$XDG_CACHE_HOME/claude-use/dashboard.html"
           test -s "$RUNNER_TEMP/backup/usage.sqlite"
-          grep -q -- '--statusline' ~/.claude/settings.json
-          if grep -q -- '--arm-clock' ~/.claude/settings.json; then exit 1; fi
+          # one hook, though installed twice; the 2.x entries gone
+          test "$(grep -c -- '--auto-import' ~/.claude/settings.json)" = 1
+          grep -q '"SessionStart"' ~/.claude/settings.json
+          if grep -q -e '--arm-clock' -e '--statusline' ~/.claude/settings.json; then exit 1; fi
           case "$RUNNER_OS" in
             Windows)
               test -f "$APPDATA/Microsoft/Windows/Start Menu/Programs/Claude Use.lnk"
@@ -102,24 +104,18 @@ jobs:
               cat "$XDG_DATA_HOME/applications/claude-use.desktop" ;;
           esac
 
-      # the status line against a fake transcript, last used 5 s ago; with no
-      # import in the last day it must also start one in the background
-      - name: Smoke test status line
+      # the hook as Claude Code runs it: a new transcript must land in the DB,
+      # with nothing printed (SessionStart output can reach Claude's context)
+      - name: Smoke test auto-import
         run: |
           mkdir -p ~/.claude/projects/ci
-          t=~/.claude/projects/ci/t.jsonl
-          now=$(python -c "import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(seconds=5)).isoformat().replace('+00:00', 'Z'))")
-          echo "{\"type\":\"assistant\",\"requestId\":\"ci-r1\",\"timestamp\":\"$now\",\"cwd\":\"/tmp\",\"message\":{\"model\":\"claude-sonnet-5\",\"id\":\"m1\",\"usage\":{\"input_tokens\":3,\"cache_read_input_tokens\":50000,\"output_tokens\":9}}}" > "$t"
-          hook=$(python -c "import json, os, sys; print(json.dumps({'session_id': 'ci', 'transcript_path': os.path.normpath(sys.argv[1])}))" "$t")
-          rm -f "$XDG_STATE_HOME/claude-use/last-import"
-          line=$(echo "$hook" | "$EXE" --statusline)
-          echo "$line"; case "$line" in "cache warm until "*) ;; *) exit 1 ;; esac
-          test -e "$XDG_STATE_HOME/claude-use/last-import"
-          imported='import os, sqlite3, sys; db = os.path.join(os.environ["XDG_DATA_HOME"], "claude-use", "usage.sqlite"); sys.exit(not sqlite3.connect(db).execute("select 1 from messages where key = ?", ("ci-r1:m1",)).fetchone())'
-          for i in $(seq 30); do python -c "$imported" && break; sleep 1; done
-          python -c "$imported"
-          # 2.x hooks not yet removed must stay quiet
-          echo "$hook" | "$EXE" --arm-clock
+          echo '{"type":"assistant","requestId":"ci-r1","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","message":{"model":"claude-sonnet-5","id":"m1","usage":{"input_tokens":3,"output_tokens":9}}}' > ~/.claude/projects/ci/t.jsonl
+          cmd=$(python -c "import json, os; s = json.load(open(os.path.expanduser('~/.claude/settings.json'))); print(s['hooks']['SessionStart'][-1]['hooks'][0]['command'])")
+          out=$(echo '{"hook_event_name":"SessionStart"}' | bash -c "$cmd" 2>&1)
+          test -z "$out"
+          python -c 'import os, sqlite3, sys; db = os.path.join(os.environ["XDG_DATA_HOME"], "claude-use", "usage.sqlite"); sys.exit(not sqlite3.connect(db).execute("select 1 from messages where key = ?", ("ci-r1:m1",)).fetchone())'
+          # 2.x entries not yet removed must stay quiet
+          for f in --statusline --arm-clock --cancel-clock; do test -z "$(echo '{}' | "$EXE" $f 2>&1)"; done
 
       # uninstall from the installed copy itself: on Windows that's the
       # delete-after-exit path

@@ -21,11 +21,11 @@ Download it, then install it from wherever it landed, with everything:
 claude-use --version
 ```
 
-`--all` adds the opt-in [status line](#status-line-optional) in Claude Code, which
-shows when the session's cache expires and keeps the history current. Leave out
-`--all` to install the app alone. If the status line can't be added (e.g. you
-already have your own), the app still installs. It tells you what to run once
-that's fixed, and exits with code 1.
+`--all` adds the opt-in [auto-import](#auto-import-optional): a Claude Code hook
+that updates the history in the background whenever a session starts. Leave out
+`--all` to install the app alone. If the hook can't be added (e.g.
+`~/.claude/settings.json` isn't valid JSON), the app still installs. It tells you
+what to run once that's fixed, and exits with code 1.
 
 `--install` copies the executable to `%LOCALAPPDATA%\Programs\claude-use\` on
 Windows, and adds that folder to your user `PATH` (new terminals pick it up), or to
@@ -34,13 +34,14 @@ creates its folders, and on the first install writes
 `~/.config/claude-use/config.toml` after asking where to keep a backup copy of the
 history (see [Backup copy](#backup-copy-optional)). `~` is `%USERPROFILE%` on
 Windows. A reinstall replaces only the executable and its shortcuts, and never asks
-again. On Windows, close any running `claude-use` first, including Claude Code,
-whose status line runs it.
+again. On Windows, close any running `claude-use` first.
 
 Nothing is scheduled: no Task Scheduler task, systemd timer, cron job or launchd
-agent, and no Claude Code hooks. 2.x had all of those, and Windows Defender flagged
-the install as `Behavior:Win32/Persistence.A!ml`. Installing 3.x over 2.x removes
-them, and on Windows moves the executable out of `~\.local\bin`.
+agent. 2.x scheduled the import that way and set an alarm task after every Claude
+response for its cache clock (a status line plus `Stop`/`SessionEnd` hooks), and
+Windows Defender flagged the install as `Behavior:Win32/Persistence.A!ml`.
+Installing 3.x over 2.x removes all of it, and on Windows moves the executable out
+of `~\.local\bin`.
 
 It also adds a way to launch it, which refreshes the history and opens the
 dashboard:
@@ -58,8 +59,8 @@ To uninstall, run `claude-use --uninstall` (or use Installed apps on Windows). I
 removes the executable, the shortcuts and `~/.cache/claude-use`, and prints what
 it leaves behind for you to delete by hand if you're done with them: your settings
 (`~/.config/claude-use`), the history DB (`~/.local/share/claude-use`) and the
-backup copy. It removes the [status line](#status-line-optional) and anything
-2.x scheduled, and warns about any other scheduled task that still runs
+backup copy. It removes the [auto-import](#auto-import-optional) hook and anything
+2.x left, and warns about any other scheduled task that still runs
 `claude-use`, but doesn't remove it.
 
 The installed `claude-use` takes the same options as the script below.
@@ -70,7 +71,7 @@ The installed `claude-use` takes the same options as the script below.
 python usage_dashboard.py              # print summary, write dashboard.html, open browser
 python usage_dashboard.py --no-open    # just generate dashboard.html
 python usage_dashboard.py --serve      # live server on http://localhost:8377 (re-parses on refresh)
-python usage_dashboard.py --import-only  # just update the history DB (what the status line runs daily)
+python usage_dashboard.py --import-only  # just update the history DB (what the auto-import hook runs, silently)
 python usage_dashboard.py --db PATH    # use a different history DB, one-off
 ```
 
@@ -125,12 +126,26 @@ Run it from one machine only: the last machine to finish overwrites the snapshot
 Only history since the first run can be kept, so it's worth raising
 `cleanupPeriodDays` as well.
 
-### Keeping the history current
+### Auto-import (optional)
 
-Every launch of the dashboard imports first. If you might go longer than
-`cleanupPeriodDays` without opening it, turn on the
-[status line](#status-line-optional): it imports in the background once a day
-while you use Claude Code, which is the only time transcripts change.
+Every launch of the dashboard imports first. To keep the history current without
+opening it, have Claude Code run the import for you:
+
+```powershell
+claude-use --enable-auto-import     # adds a hook to ~/.claude/settings.json
+claude-use --disable-auto-import    # removes it
+```
+
+That adds one `SessionStart` hook at the user level, so it covers every project.
+Whenever a session starts, resumes or is cleared, it runs the installed
+`claude-use` to import in the background (`async`: Claude Code doesn't wait for
+it). Transcripts only change while you use Claude Code, so that's the only time an
+import is needed, and it takes a second or two, so there's no throttle. It prints
+nothing, since Claude Code can add a `SessionStart` hook's output to the session's
+context. If the DB is locked, it gives up quietly and the next session catches up.
+
+It needs the installed executable. Your status line and other hooks are left alone,
+and `--uninstall` removes it too.
 
 `dashboard.html` is fully self-contained (data embedded, no CDN, works offline)
 and supports light/dark mode. It shows:
@@ -185,27 +200,6 @@ the transcript):
 | session start / subagent start | the first request of a transcript |
 | other | no gap or known event |
 | unknown | imported before causes were tracked, transcript since deleted |
-
-### Status line (optional)
-
-To see the cache clock while you work:
-
-```powershell
-claude-use --enable-statusline     # adds it to ~/.claude/settings.json
-claude-use --disable-statusline    # removes it
-```
-
-That adds a Claude Code status line at the user level, so it covers every
-project: `cache warm until 15:32`, the current session's expiry as a clock time,
-so it stays right while idle even though Claude Code doesn't redraw it. Once the
-time has passed it reads `cache expired at 15:32`.
-
-It also keeps the history current. When the last import is a day old, it starts
-`claude-use --import-only` in the background, with no window, and returns at once.
-Any import (opening the dashboard, say) resets that day.
-
-It needs the installed executable and won't replace a status line you already
-have. Nothing else in `settings.json` is touched, and `--uninstall` removes it too.
 
 ## How costs are computed
 
