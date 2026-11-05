@@ -447,6 +447,8 @@ def create_entry_points() -> None:
                                 ("EstimatedSize", INSTALLED_EXE.stat().st_size // 1024)):
                 winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, value)
         print(rf"Registered HKCU\{UNINSTALL_KEY} (Settings > Installed apps)")
+        if _user_path(add=True):
+            print(f"Added {BIN_DIR} to your user PATH (new terminals pick it up)")
     elif sys.platform.startswith("linux"):
         desktop = _desktop_file()
         desktop.parent.mkdir(parents=True, exist_ok=True)
@@ -481,11 +483,46 @@ def remove_entry_points() -> None:
             print(rf"Removed HKCU\{UNINSTALL_KEY}")
         except FileNotFoundError:
             pass
+        if _user_path(add=False):
+            print(f"Removed {BIN_DIR} from your user PATH")
     elif sys.platform.startswith("linux"):
         desktop = _desktop_file()
         if desktop.exists():
             desktop.unlink()
             print(f"Removed {desktop}")
+
+
+def _user_path(add: bool) -> bool:
+    """Windows: add BIN_DIR to, or remove it from, the user PATH (HKCU\\Environment).
+    True if PATH changed. Other entries, their order and the value's type are kept."""
+    import ctypes
+    import winreg
+
+    def same(entry: str) -> bool:
+        norm = lambda p: os.path.normcase(os.path.normpath(os.path.expandvars(p)))  # noqa: E731
+        return norm(entry) == norm(str(BIN_DIR))
+
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                        winreg.KEY_READ | winreg.KEY_WRITE) as k:
+        try:
+            value, kind = winreg.QueryValueEx(k, "Path")
+        except FileNotFoundError:
+            value, kind = "", winreg.REG_EXPAND_SZ
+        # empty parts kept, so a trailing ";" survives a round trip
+        entries = value.split(";") if value else []
+        kept = [e for e in entries if not (e and same(e))]
+        if add:
+            if len(kept) != len(entries):
+                return False  # already there
+            kept.insert(len(kept) - 1 if kept and not kept[-1] else len(kept), str(BIN_DIR))
+        elif len(kept) == len(entries):
+            return False  # wasn't there
+        winreg.SetValueEx(k, "Path", 0, kind, ";".join(kept))
+    # tell Explorer, so terminals it starts from now on see the new PATH
+    HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG = 0xFFFF, 0x001A, 0x0002
+    ctypes.windll.user32.SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment",
+                                             SMTO_ABORTIFHUNG, 5000, None)
+    return True
 
 
 def remove_installed_exe() -> None:
@@ -923,7 +960,7 @@ def install(data_dir: Path | None) -> None:
 
     on_path = any(Path(p).resolve() == BIN_DIR.resolve()
                   for p in os.environ.get("PATH", "").split(os.pathsep) if p)
-    if not on_path:
+    if not on_path and sys.platform != "win32":  # Windows: create_entry_points adds it
         print(f"Note: {BIN_DIR} is not on PATH; add it to run claude-use by name.")
 
 

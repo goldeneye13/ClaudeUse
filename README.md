@@ -28,8 +28,9 @@ already have your own), the app still installs. It tells you what to run once
 that's fixed, and exits with code 1.
 
 `--install` copies the executable to `%LOCALAPPDATA%\Programs\claude-use\` on
-Windows and `~/.local/bin/` on Linux and macOS (put that folder on `PATH` if it
-isn't), creates its folders, and on the first install writes
+Windows, and adds that folder to your user `PATH` (new terminals pick it up), or to
+`~/.local/bin/` on Linux and macOS (put that folder on `PATH` if it isn't). It
+creates its folders, and on the first install writes
 `~/.config/claude-use/config.toml` after asking where to keep a backup copy of the
 history (see [Backup copy](#backup-copy-optional)). `~` is `%USERPROFILE%` on
 Windows. A reinstall replaces only the executable and its shortcuts, and never asks
