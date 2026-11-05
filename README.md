@@ -21,20 +21,27 @@ Download it, then install it from wherever it landed, with everything:
 claude-use --version
 ```
 
-`--all` adds the two opt-in extras to the install: a daily
-[scheduled import](#scheduled-import-optional) and the
-[cache clock](#cache-clock-optional) in Claude Code. For a different interval, add
-`--schedule-import 7`. Leave out `--all` to install the app alone, or name the extras
-you want (`--install --enable-clock`). If an extra can't be set up (e.g. you
-already have your own status line), the rest still installs. It tells you what to
-run once that's fixed, and exits with code 1.
+`--all` adds the opt-in [auto-import](#auto-import-optional): a Claude Code hook
+that updates the history in the background whenever a session starts. Leave out
+`--all` to install the app alone. If the hook can't be added (e.g.
+`~/.claude/settings.json` isn't valid JSON), the app still installs. It tells you
+what to run once that's fixed, and exits with code 1.
 
-`--install` copies the executable to `~/.local/bin/` (`~` is `%USERPROFILE%` on
-Windows; put that folder on `PATH` if it isn't), creates its folders, and on the
-first install writes `~/.config/claude-use/config.toml` after asking where to keep
-a backup copy of the history (see [Backup copy](#backup-copy-optional)). A
-reinstall replaces only the executable and its shortcuts, and never asks again.
-On Windows, close any running `claude-use` (including a scheduled run) first.
+`--install` copies the executable to `%LOCALAPPDATA%\Programs\claude-use\` on
+Windows, and adds that folder to your user `PATH` (new terminals pick it up), or to
+`~/.local/bin/` on Linux and macOS (put that folder on `PATH` if it isn't). It
+creates its folders, and on the first install writes
+`~/.config/claude-use/config.toml` after asking where to keep a backup copy of the
+history (see [Backup copy](#backup-copy-optional)). `~` is `%USERPROFILE%` on
+Windows. A reinstall replaces only the executable and its shortcuts, and never asks
+again. On Windows, close any running `claude-use` first.
+
+Nothing is scheduled: no Task Scheduler task, systemd timer, cron job or launchd
+agent. 2.x scheduled the import that way and set an alarm task after every Claude
+response for its cache clock (a status line plus `Stop`/`SessionEnd` hooks), and
+Windows Defender flagged the install as `Behavior:Win32/Persistence.A!ml`.
+Installing 3.x over 2.x removes all of it, and on Windows moves the executable out
+of `~\.local\bin`.
 
 It also adds a way to launch it, which refreshes the history and opens the
 dashboard:
@@ -52,10 +59,9 @@ To uninstall, run `claude-use --uninstall` (or use Installed apps on Windows). I
 removes the executable, the shortcuts and `~/.cache/claude-use`, and prints what
 it leaves behind for you to delete by hand if you're done with them: your settings
 (`~/.config/claude-use`), the history DB (`~/.local/share/claude-use`) and the
-backup copy. It removes the job `--schedule-import` made (see
-[Scheduled import](#scheduled-import-optional)) and the
-[cache clock](#cache-clock-optional), and warns about any other
-scheduled task that still runs `claude-use`, but doesn't remove it.
+backup copy. It removes the [auto-import](#auto-import-optional) hook and anything
+2.x left, and warns about any other scheduled task that still runs
+`claude-use`, but doesn't remove it.
 
 The installed `claude-use` takes the same options as the script below.
 
@@ -65,7 +71,7 @@ The installed `claude-use` takes the same options as the script below.
 python usage_dashboard.py              # print summary, write dashboard.html, open browser
 python usage_dashboard.py --no-open    # just generate dashboard.html
 python usage_dashboard.py --serve      # live server on http://localhost:8377 (re-parses on refresh)
-python usage_dashboard.py --import-only  # just update the history DB (what the scheduled import runs)
+python usage_dashboard.py --import-only  # just update the history DB (what the auto-import hook runs, silently)
 python usage_dashboard.py --db PATH    # use a different history DB, one-off
 ```
 
@@ -88,7 +94,7 @@ which covers everything since the first run.
 - It's a plain SQLite file: open it with [DB Browser for SQLite](https://sqlitebrowser.org/),
   DBeaver, the `sqlite3` CLI, or Python. In DB Browser, use **File > Open
   Database Read-Only**: unsaved changes there (a cell edit, an UPDATE not yet
-  written) lock the DB, and the dashboard or a scheduled import waits 15 s, then
+  written) lock the DB, and the dashboard or a background import waits 15 s, then
   stops with a one-line message and changes nothing. Don't open it from two
   machines at once.
 
@@ -120,29 +126,26 @@ Run it from one machine only: the last machine to finish overwrites the snapshot
 Only history since the first run can be kept, so it's worth raising
 `cleanupPeriodDays` as well.
 
-### Scheduled import (optional)
+### Auto-import (optional)
 
-Every launch imports first, so this only matters if you might go longer than
-`cleanupPeriodDays` without opening the dashboard. To have the installed
-executable run `--import-only` in the background:
+Every launch of the dashboard imports first. To keep the history current without
+opening it, have Claude Code run the import for you:
 
 ```powershell
-claude-use --schedule-import      # daily
-claude-use --schedule-import 7    # every 7 days
-claude-use --unschedule-import    # remove it
+claude-use --enable-auto-import     # adds a hook to ~/.claude/settings.json
+claude-use --disable-auto-import    # removes it
 ```
 
-Running it again replaces the job, so that's also how you change the interval.
-It warns if the interval isn't well below `cleanupPeriodDays`. The job always
-runs `~/.local/bin/claude-use`, so `--install` first.
+That adds one `SessionStart` hook at the user level, so it covers every project.
+Whenever a session starts, resumes or is cleared, it runs the installed
+`claude-use` to import in the background (`async`: Claude Code doesn't wait for
+it). Transcripts only change while you use Claude Code, so that's the only time an
+import is needed, and it takes a second or two, so there's no throttle. It prints
+nothing, since Claude Code can add a `SessionStart` hook's output to the session's
+context. If the DB is locked, it gives up quietly and the next session catches up.
 
-- **Windows:** a Task Scheduler task, `claude-use import`, at noon, as you, with
-  no console window. A run missed while the PC was off happens at the next
-  chance.
-- **Linux:** a systemd user timer (`~/.config/systemd/user/claude-use-import.timer`),
-  persistent, so missed runs catch up. With no systemd user session it falls back
-  to a crontab line, which doesn't catch up.
-- **macOS:** a launchd agent (`~/Library/LaunchAgents/claude-use-import.plist`).
+It needs the installed executable. Your status line and other hooks are left alone,
+and `--uninstall` removes it too.
 
 `dashboard.html` is fully self-contained (data embedded, no CDN, works offline)
 and supports light/dark mode. It shows:
@@ -198,36 +201,6 @@ the transcript):
 | other | no gap or known event |
 | unknown | imported before causes were tracked, transcript since deleted |
 
-### Cache clock (optional)
-
-To see the clock while you work, and get warned before it runs out:
-
-```powershell
-claude-use --enable-clock     # adds it to ~/.claude/settings.json
-claude-use --disable-clock    # removes it
-```
-
-That adds, at the user level so it covers every project:
-
-- a **status line**: `cache warm until 15:32`, the current session's expiry as a
-  clock time, so it stays right while idle even though Claude Code doesn't redraw
-  it. Once the time has passed it reads `cache expired at 15:32`.
-- a **`Stop` hook** that, after every response, replaces that session's one-off
-  alarm with one set for 10 minutes before expiry. If you haven't used the session
-  when it fires, you get a notification with the project, the expiry time and
-  about what a rebuild would cost. If you have, it stays quiet.
-- a **`SessionEnd` hook** that cancels the alarm when you close the session.
-
-Nothing runs between responses. The alarm is a one-off Task Scheduler task under
-`\claude-use\clock\` (Windows), a transient systemd user timer (Linux), or a
-sleeping process (macOS, or Linux without systemd). Notifications come from
-PowerShell on Windows, `notify-send` on Linux (skipped with no desktop) and
-`osascript` on macOS (credited to Script Editor; it asks for permission once).
-The Linux and macOS paths are untested.
-
-It needs the installed executable and won't replace a status line you already
-have. Your other hooks are left alone, and `--uninstall` removes it too.
-
 ## How costs are computed
 
 Each assistant message in the transcripts carries a `usage` block. Duplicated
@@ -280,4 +253,8 @@ selected range — edit `SUBSCRIPTION_MONTHLY` / `SUBSCRIPTION_NAME` at the top 
 
 - `usage_dashboard.py` — parser, SQLite history, pricing, CLI, tiny HTTP server, installer
 - `template.html` — dashboard template (data injected at `/*__DATA__*/`)
+- `assets/` — the app icon: `make_icon.py` holds its geometry and writes `icon.svg`,
+  `icon.ico` (built into the Windows exe), `icon.png` (the Linux launcher's) and the
+  dashboard's inline favicon. Run it by hand when the icon changes (needs Pillow,
+  which the app itself doesn't), and commit what it writes.
 - `~/.cache/claude-use/dashboard.html` — generated output (safe to delete/regenerate)
