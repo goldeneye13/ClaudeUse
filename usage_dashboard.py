@@ -727,7 +727,10 @@ def import_in_background() -> None:
     # and the import must outlive this status line process
     kw = ({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32"
           else {"start_new_session": True})
-    subprocess.Popen([*cmd, "--import-only"], stdin=subprocess.DEVNULL,
+    # a one-file build would otherwise reuse this process's unpacked files,
+    # which are deleted as soon as it exits (PyInstaller 6.9+)
+    env = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+    subprocess.Popen([*cmd, "--import-only"], env=env, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **kw)
 
 
