@@ -37,10 +37,6 @@ jobs:
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
       GH_TOKEN: ${{ github.token }}
-      XDG_CONFIG_HOME: ${{ runner.temp }}/config
-      XDG_DATA_HOME: ${{ runner.temp }}/share
-      XDG_CACHE_HOME: ${{ runner.temp }}/cache
-      XDG_STATE_HOME: ${{ runner.temp }}/state
     steps:
       - uses: actions/checkout@v5
         with:
@@ -64,8 +60,12 @@ jobs:
             echo "::error::tag $TAG but __version__ says '$ver'"; exit 1
           fi
 
-      - name: Installed path
+      # the runner context isn't available in job-level env, so set them here
+      - name: Paths
         run: |
+          for d in CONFIG:config DATA:share CACHE:cache STATE:state; do
+            echo "XDG_${d%%:*}_HOME=$RUNNER_TEMP/${d#*:}" >> "$GITHUB_ENV"
+          done
           if [ "$RUNNER_OS" = Windows ]; then
             echo "EXE=$(cygpath -u "$LOCALAPPDATA")/Programs/claude-use/claude-use.exe" >> "$GITHUB_ENV"
           else
