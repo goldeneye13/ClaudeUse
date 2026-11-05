@@ -11,10 +11,9 @@ Usage:
     python usage_dashboard.py --no-open  # just generate
     python usage_dashboard.py --serve    # serve on http://localhost:8377 (regenerates per request)
     python usage_dashboard.py --import-only  # just update the history DB
-    claude-use --install [--all]         # (release exe) install into ~/.local/bin; --all adds the extras below
+    claude-use --install [--all]         # (release exe) install it; --all adds the status line
     claude-use --uninstall               # remove it again; keeps history and settings
-    claude-use --schedule-import [DAYS]  # run --import-only every DAYS days (default 1)
-    claude-use --enable-clock            # status line + toast before a session's cache expires
+    claude-use --enable-statusline       # Claude Code status line: cache expiry, daily import
 
 No dependencies beyond the standard library.
 """
@@ -56,8 +55,15 @@ def _xdg(var: str, default: str) -> Path:
     return _xdg_base(var, default) / APP
 
 
-BIN_DIR = Path.home() / ".local" / "bin"  # no XDG variable for this one
-INSTALLED_EXE = BIN_DIR / ("claude-use.exe" if os.name == "nt" else "claude-use")
+LEGACY_BIN_DIR = Path.home() / ".local" / "bin"  # no XDG variable for this one
+# Windows: the standard per-user install folder. 2.x used ~/.local/bin there
+# too, a Unix convention, and an exe running from it is one of Defender's
+# persistence signals (JMR-161). Only the exe moves; data stays XDG.
+BIN_DIR = (Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+           / "Programs" / APP if os.name == "nt" else LEGACY_BIN_DIR)
+EXE_NAME = "claude-use.exe" if os.name == "nt" else "claude-use"
+INSTALLED_EXE = BIN_DIR / EXE_NAME
+LEGACY_EXE = LEGACY_BIN_DIR / EXE_NAME  # differs from INSTALLED_EXE on Windows only
 CONFIG_FILE = _xdg("XDG_CONFIG_HOME", ".config") / "config.toml"
 # Permanent history: Claude Code deletes transcripts after cleanupPeriodDays
 # (default 30), so every run copies them into this DB first. Override with --db.
@@ -498,37 +504,145 @@ def remove_installed_exe() -> None:
                   " foreach ($i in 1..20) {"
                   " Remove-Item -LiteralPath $env:CU_EXE -Force -ErrorAction SilentlyContinue;"
                   " if (-not (Test-Path -LiteralPath $env:CU_EXE)) { break };"
-                  " Start-Sleep -Milliseconds 500 }")
+                  " Start-Sleep -Milliseconds 500 };"
+                  " if (-not (Get-ChildItem -LiteralPath $env:CU_DIR -Force -ErrorAction SilentlyContinue))"
+                  " { Remove-Item -LiteralPath $env:CU_DIR -ErrorAction SilentlyContinue }")
         pids = [os.getpid()]
         # one-file build: the parent is the launcher, unpacked to a temp dir
         if Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) != Path(sys.executable).parent:
             pids.append(os.getppid())
         subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                         env={**os.environ, "CU_EXE": str(INSTALLED_EXE),
+                         env={**os.environ, "CU_EXE": str(INSTALLED_EXE), "CU_DIR": str(BIN_DIR),
                               "CU_PIDS": ",".join(map(str, pids))},
                          close_fds=True, creationflags=subprocess.CREATE_NO_WINDOW)
         print(f"Removed {INSTALLED_EXE} (deleted once this window closes)")
     else:
         INSTALLED_EXE.unlink()
         print(f"Removed {INSTALLED_EXE}")
+        if sys.platform == "win32":  # the folder is ours there, not a shared bin
+            try:
+                BIN_DIR.rmdir()
+            except OSError:  # not empty
+                pass
+
+
+# Leftovers from 2.x, which scheduled the import with the OS scheduler and
+# set a one-off alarm task after every Claude response. Windows Defender
+# flagged that as persistence (JMR-161), so 3.x schedules nothing: --install
+# and --uninstall only remove what 2.x left, found by fixed name.
+
+LEGACY_JOB = f"{APP} import"                    # Windows task name, crontab marker
+LEGACY_UNIT = f"{APP}-import"                   # systemd units, launchd label
+LEGACY_CLOCK_TASKS = rf"\{APP}\clock" "\\"      # Windows task folder
+LEGACY_CLOCK_UNIT = f"{APP}-clock"              # transient systemd timers
+LEGACY_CLOCK_PIDS = _xdg("XDG_STATE_HOME", ".local/state") / "clock"  # sleeping alarms
+LEGACY_HOOK_FLAGS = ("--arm-clock", "--cancel-clock")
+
+
+def _windows_tasks() -> list[str]:
+    """Scheduled tasks whose definition mentions the app."""
+    import csv
+    import subprocess
+
+    out = subprocess.run(["schtasks", "/query", "/fo", "csv", "/v"],
+                         capture_output=True, text=True).stdout
+    rows = list(csv.reader(out.splitlines()))
+    if not rows:
+        return []
+    header = rows[0]
+    col = header.index("TaskName") if "TaskName" in header else 1
+    return list(dict.fromkeys(r[col] for r in rows[1:] if r != header and len(r) > col
+                              and APP in " ".join(r).lower()))
+
+
+def _systemd_dir() -> Path:
+    """Where the user manager looks for units: its own XDG_CONFIG_HOME, which
+    needn't match this process's (set in a shell profile, say), else ~/.config."""
+    import subprocess
+
+    base = Path.home() / ".config"
+    if shutil.which("systemctl"):
+        out = subprocess.run(["systemctl", "--user", "show-environment"],
+                             capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            if line.startswith("XDG_CONFIG_HOME=") and Path(line[16:]).is_absolute():
+                base = Path(line[16:])
+    return base / "systemd" / "user"
+
+
+def remove_legacy_jobs() -> None:
+    """Remove the 2.x scheduled import and any pending cache clock alarms."""
+    import subprocess
+
+    if sys.platform == "win32":
+        for name in _windows_tasks():
+            if name.lstrip("\\") == LEGACY_JOB or name.startswith(LEGACY_CLOCK_TASKS):
+                if subprocess.run(["schtasks", "/delete", "/tn", name, "/f"],
+                                  capture_output=True).returncode == 0:
+                    print(f'Removed scheduled task "{name}" (from 2.x)')
+    elif sys.platform == "darwin":
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{LEGACY_UNIT}.plist"
+        if plist.exists():
+            subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LEGACY_UNIT}"],
+                           capture_output=True)
+            plist.unlink()
+            print(f"Removed {plist} (from 2.x)")
+    else:
+        if shutil.which("systemctl"):
+            timer = _systemd_dir() / f"{LEGACY_UNIT}.timer"
+            if timer.exists():
+                subprocess.run(["systemctl", "--user", "disable", "--now", timer.name],
+                               capture_output=True)
+                for f in (timer, timer.with_suffix(".service")):
+                    f.unlink(missing_ok=True)
+                    print(f"Removed {f} (from 2.x)")
+                subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+            subprocess.run(["systemctl", "--user", "stop", f"{LEGACY_CLOCK_UNIT}-*.timer"],
+                           capture_output=True)
+        if shutil.which("crontab"):
+            out = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+            keep = [line for line in out.splitlines() if not line.endswith(f"# {LEGACY_JOB}")]
+            if len(keep) != len(out.splitlines()):
+                subprocess.run(["crontab", "-"], input="".join(f"{line}\n" for line in keep),
+                               text=True, check=True)
+                print("Removed the claude-use import line from crontab (from 2.x)")
+    if LEGACY_CLOCK_PIDS.is_dir():
+        import signal
+
+        for f in LEGACY_CLOCK_PIDS.glob("*.pid"):
+            try:
+                os.kill(int(f.read_text()), signal.SIGTERM)
+            except (OSError, ValueError):  # already gone
+                pass
+            f.unlink(missing_ok=True)
+        try:
+            LEGACY_CLOCK_PIDS.rmdir()
+        except OSError:
+            pass
+
+
+def remove_legacy_exe() -> None:
+    """Windows: 2.x installed to ~/.local/bin, 3.x to the standard per-user folder."""
+    if sys.platform != "win32" or not LEGACY_EXE.exists():
+        return
+    if Path(sys.executable).resolve() == LEGACY_EXE.resolve():
+        print(f"Left {LEGACY_EXE}: it's the copy running now. Delete it once this closes.")
+        return
+    try:
+        LEGACY_EXE.unlink()
+        print(f"Removed {LEGACY_EXE} (2.x location)")
+    except PermissionError:
+        print(f"Couldn't remove {LEGACY_EXE}: it's running. Delete it by hand.")
 
 
 def warn_scheduled_tasks() -> None:
-    """List scheduled jobs that mention the app. Run after unschedule_import(),
+    """List scheduled jobs that mention the app. Run after remove_legacy_jobs(),
     so anything left was made by hand: never delete it."""
     import subprocess
 
     hits = []
     if sys.platform == "win32":
-        import csv
-        out = subprocess.run(["schtasks", "/query", "/fo", "csv", "/v"],
-                             capture_output=True, text=True).stdout
-        rows = list(csv.reader(out.splitlines()))
-        if rows:
-            header = rows[0]
-            col = header.index("TaskName") if "TaskName" in header else 1
-            hits = [r[col] for r in rows[1:] if r != header and len(r) > col
-                    and APP in " ".join(r).lower()]
+        hits = _windows_tasks()
     else:
         try:
             out = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
@@ -547,226 +661,15 @@ def warn_scheduled_tasks() -> None:
             print(f"  {h}")
 
 
-# Scheduled import: one job, found by fixed name, that runs the installed exe
-# with --import-only every N days, so history survives weeks without opening
-# the dashboard. Re-running replaces it; --uninstall removes it.
+# Status line (JMR-153, JMR-161). Claude Code runs it on every redraw: it
+# shows when the session's cache expires and, at most once per
+# IMPORT_EVERY_S, starts an --import-only in the background. That's the only
+# scheduler: transcripts only change while Claude Code runs, and it runs this.
 
-JOB_NAME = f"{APP} import"     # Windows task name and crontab marker
-JOB_UNIT = f"{APP}-import"     # systemd units / launchd label
-
-
-def _cleanup_period_days() -> int:
-    try:
-        settings = json.loads((Path.home() / ".claude" / "settings.json").read_text(encoding="utf-8"))
-        return int(settings.get("cleanupPeriodDays", 30))
-    except (OSError, ValueError, TypeError, AttributeError):
-        return 30  # Claude Code's default
-
-
-def _systemd_dir() -> Path:
-    """Where the user manager looks for units: its own XDG_CONFIG_HOME, which
-    needn't match this process's (set in a shell profile, say), else ~/.config."""
-    import subprocess
-
-    base = Path.home() / ".config"
-    if shutil.which("systemctl"):
-        out = subprocess.run(["systemctl", "--user", "show-environment"],
-                             capture_output=True, text=True).stdout
-        for line in out.splitlines():
-            if line.startswith("XDG_CONFIG_HOME=") and Path(line[16:]).is_absolute():
-                base = Path(line[16:])
-    return base / "systemd" / "user"
-
-
-def _launchd_plist() -> Path:
-    return Path.home() / "Library" / "LaunchAgents" / f"{JOB_UNIT}.plist"
-
-
-def _has_systemd_user() -> bool:
-    import subprocess
-
-    if not shutil.which("systemctl"):
-        return False
-    return subprocess.run(["systemctl", "--user", "show-environment"],
-                          capture_output=True).returncode == 0
-
-
-def _strip_crontab() -> tuple[str, bool]:
-    """Current crontab without our line, and whether it had one."""
-    import subprocess
-
-    try:
-        out = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
-    except OSError:  # no cron installed
-        return "", False
-    keep = [line for line in out.splitlines() if not line.endswith(f"# {JOB_NAME}")]
-    return "".join(f"{line}\n" for line in keep), len(keep) != len(out.splitlines())
-
-
-def _windows_task_xml(days: int) -> str:
-    start = datetime.now().strftime("%Y-%m-%dT12:00:00")
-    # conhost --headless: a console exe started by Task Scheduler otherwise
-    # opens a window on every run. StartWhenAvailable: a laptop that was off
-    # at noon catches up at the next chance.
-    return f"""<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>Copy new Claude Code transcript data into the claude-use history DB.</Description>
-  </RegistrationInfo>
-  <Triggers>
-    <CalendarTrigger>
-      <StartBoundary>{start}</StartBoundary>
-      <ScheduleByDay><DaysInterval>{days}</DaysInterval></ScheduleByDay>
-    </CalendarTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>conhost.exe</Command>
-      <Arguments>--headless "{INSTALLED_EXE}" --import-only</Arguments>
-    </Exec>
-  </Actions>
-</Task>
-"""
-
-
-def schedule_import(days: int) -> None:
-    import subprocess
-
-    if not INSTALLED_EXE.exists():
-        sys.exit(f"{INSTALLED_EXE} not found: run claude-use --install first."
-                 " The scheduled job runs the installed copy, never a checkout.")
-    cleanup = _cleanup_period_days()
-    if days * 2 > cleanup:
-        print(f"Warning: every {days} days is not well below cleanupPeriodDays ({cleanup}):"
-              " transcripts may be deleted before a missed run catches up.")
-    every = "daily" if days == 1 else f"every {days} days"
-
-    if sys.platform == "win32":
-        # XML in through an env var, so no PowerShell quoting to get wrong;
-        # -Force replaces an existing task of the same name
-        script = ("Register-ScheduledTask -TaskName $env:CU_TASK -Xml $env:CU_XML -Force"
-                  " | Out-Null")
-        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                       env={**os.environ, "CU_TASK": JOB_NAME,
-                            "CU_XML": _windows_task_xml(days)},
-                       check=True)
-        print(f'Scheduled task "{JOB_NAME}": {every} at noon, or at the next chance if missed')
-    elif sys.platform == "darwin":
-        import plistlib
-
-        plist = _launchd_plist()
-        plist.parent.mkdir(parents=True, exist_ok=True)
-        domain = f"gui/{os.getuid()}"
-        subprocess.run(["launchctl", "bootout", f"{domain}/{JOB_UNIT}"], capture_output=True)
-        # launchd runs a missed interval on wake
-        plist.write_bytes(plistlib.dumps({
-            "Label": JOB_UNIT,
-            "ProgramArguments": [str(INSTALLED_EXE), "--import-only"],
-            "StartInterval": days * 86400,
-        }))
-        subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True)
-        print(f"Scheduled launchd agent {plist}: {every}")
-    elif _has_systemd_user():
-        units = _systemd_dir()
-        units.mkdir(parents=True, exist_ok=True)
-        # day-of-month step: never more than N days apart, though it resets
-        # on the 1st; Persistent catches up a run missed while powered off
-        when = "*-*-* 12:00:00" if days == 1 else f"*-*-01/{days} 12:00:00"
-        (units / f"{JOB_UNIT}.service").write_text(
-            "[Unit]\n"
-            "Description=Copy new Claude Code transcript data into the claude-use history DB\n"
-            "\n"
-            "[Service]\n"
-            "Type=oneshot\n"
-            f'ExecStart="{INSTALLED_EXE}" --import-only\n', encoding="utf-8")
-        (units / f"{JOB_UNIT}.timer").write_text(
-            "[Unit]\n"
-            f"Description=claude-use import, {every}\n"
-            "\n"
-            "[Timer]\n"
-            f"OnCalendar={when}\n"
-            "Persistent=true\n"
-            "\n"
-            "[Install]\n"
-            "WantedBy=timers.target\n", encoding="utf-8")
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-        subprocess.run(["systemctl", "--user", "enable", "--now", f"{JOB_UNIT}.timer"],
-                       check=True, capture_output=True)
-        print(f"Scheduled systemd user timer {units / f'{JOB_UNIT}.timer'}: {every}")
-    else:
-        if not shutil.which("crontab"):
-            sys.exit("No systemd user session and no crontab: schedule"
-                     f" {INSTALLED_EXE} --import-only yourself.")
-        crontab, _ = _strip_crontab()
-        dom = "*" if days == 1 else f"*/{days}"
-        crontab += f'0 12 {dom} * * "{INSTALLED_EXE}" --import-only # {JOB_NAME}\n'
-        subprocess.run(["crontab", "-"], input=crontab, text=True, check=True)
-        print(f"Scheduled crontab entry: {every} at noon (cron doesn't catch up missed runs)")
-    print(f"  runs: {INSTALLED_EXE} --import-only")
-
-
-def unschedule_import() -> bool:
-    """Remove the job schedule_import made, if any. True if one was removed."""
-    import subprocess
-
-    removed = False
-    if sys.platform == "win32":
-        removed = subprocess.run(["schtasks", "/delete", "/tn", JOB_NAME, "/f"],
-                                 capture_output=True).returncode == 0
-        if removed:
-            print(f'Removed scheduled task "{JOB_NAME}"')
-    elif sys.platform == "darwin":
-        plist = _launchd_plist()
-        if plist.exists():
-            subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{JOB_UNIT}"],
-                           capture_output=True)
-            plist.unlink()
-            print(f"Removed {plist}")
-            removed = True
-    else:
-        timer = _systemd_dir() / f"{JOB_UNIT}.timer"
-        if timer.exists():
-            subprocess.run(["systemctl", "--user", "disable", "--now", timer.name],
-                           capture_output=True)
-            for f in (timer, timer.with_suffix(".service")):
-                f.unlink(missing_ok=True)
-                print(f"Removed {f}")
-            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
-            removed = True
-        crontab, had = _strip_crontab()
-        if had:
-            subprocess.run(["crontab", "-"], input=crontab, text=True, check=True)
-            print("Removed the claude-use import line from crontab")
-            removed = True
-    return removed
-
-
-# Cache clock (JMR-153): Claude Code's status line shows when the session's
-# cache expires, and a Stop hook sets a one-off alarm for CLOCK_WARN_S before
-# that, replaced after every response. Nothing runs in between: the alarm is a
-# Task Scheduler task (Windows), a transient systemd timer (Linux) or a
-# sleeping process (macOS, or Linux without systemd).
-
-CLOCK_WARN_S = 600
-CLOCK_TASKS = rf"\{APP}\clock" "\\"           # Windows task folder
-CLOCK_UNIT = f"{APP}-clock"                    # systemd unit prefix
-CLOCK_PIDS = _xdg("XDG_STATE_HOME", ".local/state") / "clock"  # sleeping alarms
 CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
-# PowerShell's own app id: a toast needs a registered one, and this one always is
-PS_APP_ID = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
+STATUSLINE_FLAG = "--statusline"
+IMPORT_EVERY_S = 86400
+IMPORT_STAMP = _xdg("XDG_STATE_HOME", ".local/state") / "last-import"
 
 
 def last_request(transcript: Path) -> dict | None:
@@ -802,19 +705,38 @@ def last_request(transcript: Path) -> dict | None:
         return None
 
 
-def _hook_input() -> tuple[str, Path] | None:
-    """(session_id, transcript_path) from the JSON Claude Code pipes to a hook."""
+def stamp_import() -> None:
+    IMPORT_STAMP.parent.mkdir(parents=True, exist_ok=True)
+    IMPORT_STAMP.touch()
+
+
+def import_in_background() -> None:
+    """Start --import-only, with no window, if the last import was IMPORT_EVERY_S ago."""
+    import subprocess
+    import time
+
     try:
-        info = json.load(sys.stdin)
-    except ValueError:
-        return None
-    sid, tp = info.get("session_id") or "", info.get("transcript_path") or ""
-    # the id becomes a task / unit / file name
-    return (sid, Path(tp)) if re.fullmatch(r"[\w-]+", sid) and tp else None
+        if time.time() - IMPORT_STAMP.stat().st_mtime < IMPORT_EVERY_S:
+            return
+    except FileNotFoundError:
+        pass
+    stamp_import()  # claim it first: the next redraw is moments away
+    cmd = ([sys.executable] if getattr(sys, "frozen", False)
+           else [sys.executable, str(Path(__file__).resolve())])
+    # its own console (hidden) or session: Claude Code mustn't wait for it,
+    # and the import must outlive this status line process
+    kw = ({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32"
+          else {"start_new_session": True})
+    subprocess.Popen([*cmd, "--import-only"], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **kw)
 
 
 def statusline() -> None:
     """Status line: the expiry as a clock time, right even if it isn't redrawn while idle."""
+    try:
+        import_in_background()
+    except OSError:  # never lose the status line over it
+        pass
     try:
         info = json.load(sys.stdin)
     except ValueError:
@@ -827,186 +749,16 @@ def statusline() -> None:
     print(f"cache {word} {exp:%H:%M}")
 
 
-def arm_clock() -> None:
-    """Stop hook: replace this session's alarm with one CLOCK_WARN_S before expiry."""
-    hook = _hook_input()
-    if not hook:
-        return
-    sid, transcript = hook
-    last = last_request(transcript)
-    cancel_clock(sid)
-    if not last:
-        return
-    delay = (last["t"] + timedelta(seconds=CACHE_TTL_S - CLOCK_WARN_S)
-             - datetime.now(timezone.utc)).total_seconds()
-    if delay > 0:
-        _set_alarm(sid, transcript, delay)
+# Our entries in ~/.claude/settings.json, found by the flags they run, so
+# nothing else there is ever touched.
 
-
-def _clock_args(sid: str, transcript: Path) -> list[str]:
-    return [str(INSTALLED_EXE), "--clock-fire", sid, str(transcript)]
-
-
-def _set_alarm(sid: str, transcript: Path, delay: float) -> None:
-    import subprocess
-
-    if sys.platform == "win32":
-        import tempfile
-        from xml.sax.saxutils import escape
-
-        start = datetime.now() + timedelta(seconds=delay)
-        args = " ".join(f'"{a}"' if " " in a else a for a in _clock_args(sid, transcript)[1:])
-        # EndBoundary + DeleteExpiredTaskAfter: Windows tidies it up even if
-        # it never fires (PC asleep); --clock-fire also deletes it when done
-        xml = f"""<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers>
-    <TimeTrigger>
-      <StartBoundary>{start:%Y-%m-%dT%H:%M:%S}</StartBoundary>
-      <EndBoundary>{start + timedelta(seconds=CLOCK_WARN_S):%Y-%m-%dT%H:%M:%S}</EndBoundary>
-    </TimeTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <DeleteExpiredTaskAfter>PT0S</DeleteExpiredTaskAfter>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>conhost.exe</Command>
-      <Arguments>--headless "{escape(str(INSTALLED_EXE))}" {escape(args)}</Arguments>
-    </Exec>
-  </Actions>
-</Task>
-"""
-        # schtasks + a file, not Register-ScheduledTask: this runs after every
-        # response, and loading the PowerShell module takes seconds
-        with tempfile.NamedTemporaryFile("w", encoding="utf-16", suffix=".xml",
-                                         delete=False) as f:
-            f.write(xml)
-        try:
-            subprocess.run(["schtasks", "/create", "/tn", CLOCK_TASKS + sid, "/xml", f.name, "/f"],
-                           capture_output=True, check=True)
-        finally:
-            os.unlink(f.name)
-    elif sys.platform.startswith("linux") and _has_systemd_user():
-        subprocess.run(["systemd-run", "--user", "--collect", "--quiet",
-                        f"--unit={CLOCK_UNIT}-{sid}", f"--on-active={int(delay)}s",
-                        "--timer-property=AccuracySec=5s", *_clock_args(sid, transcript)],
-                       capture_output=True, check=True)
-    else:
-        CLOCK_PIDS.mkdir(parents=True, exist_ok=True)
-        p = subprocess.Popen([*_clock_args(sid, transcript), "--clock-delay", str(int(delay))],
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
-        (CLOCK_PIDS / f"{sid}.pid").write_text(str(p.pid))
-
-
-def cancel_clock(sid: str) -> None:
-    import subprocess
-
-    if sys.platform == "win32":
-        subprocess.run(["schtasks", "/delete", "/tn", CLOCK_TASKS + sid, "/f"], capture_output=True)
-    elif sys.platform.startswith("linux") and shutil.which("systemctl"):
-        subprocess.run(["systemctl", "--user", "stop", f"{CLOCK_UNIT}-{sid}.timer"],
-                       capture_output=True)
-    pid_file = CLOCK_PIDS / f"{sid}.pid"
-    if pid_file.exists():
-        import signal
-
-        try:
-            os.kill(int(pid_file.read_text()), signal.SIGTERM)
-        except (OSError, ValueError):  # already gone
-            pass
-        pid_file.unlink(missing_ok=True)
-
-
-def notify(title: str, body: str) -> None:
-    import subprocess
-
-    if sys.platform == "win32":
-        from xml.sax.saxutils import escape
-
-        # scenario="reminder": stays on screen until dismissed (a plain toast's
-        # banner is gone in ~5 s) and can show through Do not disturb; it needs
-        # at least one button to do that
-        toast = ('<toast scenario="reminder"><visual><binding template="ToastGeneric">'
-                 f"<text>{escape(title)}</text><text>{escape(body)}</text></binding></visual>"
-                 '<actions><action content="Dismiss" arguments="dismiss" activationType="system"/>'
-                 '</actions><audio src="ms-winsoundevent:Notification.Reminder"/></toast>')
-        # XML in through an env var, so no PowerShell quoting to get wrong
-        script = (
-            "$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications,"
-            " ContentType = WindowsRuntime];"
-            " $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument,"
-            " ContentType = WindowsRuntime];"
-            " $x = New-Object Windows.Data.Xml.Dom.XmlDocument; $x.LoadXml($env:CU_TOAST);"
-            " [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($env:CU_APP)"
-            ".Show([Windows.UI.Notifications.ToastNotification]::new($x))")
-        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                       env={**os.environ, "CU_TOAST": toast, "CU_APP": PS_APP_ID},
-                       capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-    elif sys.platform == "darwin":
-        subprocess.run(["osascript", "-e", 'display notification (system attribute "CU_BODY")'
-                        ' with title (system attribute "CU_TITLE")'],
-                       env={**os.environ, "CU_TITLE": title, "CU_BODY": body}, capture_output=True)
-    elif shutil.which("notify-send") and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
-        subprocess.run(["notify-send", "--app-name=Claude Use", title, body], capture_output=True)
-    # no desktop: nowhere to show it; the status line still has the time
-
-
-def clock_fire(sid: str, transcript: Path, delay: int) -> None:
-    """The alarm: warn if the session is still idle and its cache about to expire."""
-    import subprocess
-    import time
-
-    if delay:  # sleeping-process alarm
-        time.sleep(delay)
-    try:
-        last = last_request(transcript)
-        if not last:
-            return
-        exp = last["t"] + timedelta(seconds=CACHE_TTL_S)
-        left = (exp - datetime.now(timezone.utc)).total_seconds()
-        # used since (left is bigger: a newer alarm covers it), or already
-        # expired (woke from sleep): either way a warning would be wrong
-        if not 0 < left <= CLOCK_WARN_S + 60:
-            return
-        rin, _, _ = rates_for(last["model"], last["speed"])
-        cost = last["ctx"] * rin * CACHE_W1 / 1e6
-        idle = round((datetime.now(timezone.utc) - last["t"]).total_seconds() / 60)
-        notify(f"Claude Code cache expires at {exp.astimezone():%H:%M}",
-               f"{short_path(last['cwd']) or 'A session'}: idle {idle} min. Coming back after that"
-               f" rebuilds {last['ctx'] / 1000:,.0f}K tokens, about ${cost:.2f}.")
-    finally:
-        if sys.platform == "win32":
-            subprocess.run(["schtasks", "/delete", "/tn", CLOCK_TASKS + sid, "/f"],
-                           capture_output=True)
-        pid_file = CLOCK_PIDS / f"{sid}.pid"
-        if delay and pid_file.exists() and pid_file.read_text() == str(os.getpid()):
-            pid_file.unlink(missing_ok=True)
-
-
-# The clock's entries in ~/.claude/settings.json, found by the flags they
-# run so --disable-clock never touches anything else.
-
-CLOCK_FLAGS = ("--statusline", "--arm-clock", "--cancel-clock")
-
-
-def _clock_cmd(flag: str) -> str:
-    # hooks run in Git Bash on Windows: forward slashes, quoted
+def _our_cmd(flag: str) -> str:
+    # Claude Code runs it in Git Bash on Windows: forward slashes, quoted
     return f'"{INSTALLED_EXE.as_posix()}" {flag}'
 
 
-def _is_clock_cmd(cmd: str) -> bool:
-    return APP in cmd and any(cmd.endswith(f) for f in CLOCK_FLAGS)
+def _is_ours(cmd: str) -> bool:
+    return APP in cmd and any(cmd.endswith(f) for f in (STATUSLINE_FLAG, *LEGACY_HOOK_FLAGS))
 
 
 def _load_claude_settings() -> dict:
@@ -1025,65 +777,67 @@ def _save_claude_settings(s: dict) -> None:
     os.replace(tmp, CLAUDE_SETTINGS)  # Claude Code watches this file: never half-written
 
 
-def _without_clock_hooks(groups: list) -> list:
-    return [g for g in groups
-            if not any(_is_clock_cmd(h.get("command", "")) for h in g.get("hooks", []))]
+def _strip_legacy_hooks(s: dict) -> bool:
+    """Drop the 2.x cache clock hooks (Stop, SessionEnd). True if there were any."""
+    hooks = s.get("hooks") or {}
+    found = False
+    for event in ("Stop", "SessionEnd"):
+        if event in hooks:
+            kept = [g for g in hooks[event]
+                    if not any(_is_ours(h.get("command", "")) for h in g.get("hooks", []))]
+            if len(kept) != len(hooks[event]):
+                found = True
+                if kept:
+                    hooks[event] = kept
+                else:
+                    del hooks[event]
+    if found and not hooks:
+        del s["hooks"]
+    return found
 
 
-def enable_clock() -> None:
+def migrate_claude_settings() -> None:
+    """On install: drop the 2.x hooks, and point our status line at this install."""
+    if not CLAUDE_SETTINGS.exists():
+        return
+    s = _load_claude_settings()
+    changed = _strip_legacy_hooks(s)
+    if changed:
+        print(f"Removed the 2.x cache clock hooks from {CLAUDE_SETTINGS}")
+    line = s.get("statusLine") or {}
+    if _is_ours(line.get("command", "")) and line["command"] != _our_cmd(STATUSLINE_FLAG):
+        line["command"] = _our_cmd(STATUSLINE_FLAG)
+        changed = True
+        print(f"Pointed the status line in {CLAUDE_SETTINGS} at {INSTALLED_EXE}")
+    if changed:
+        _save_claude_settings(s)
+
+
+def enable_statusline() -> None:
     if not INSTALLED_EXE.exists():
         sys.exit(f"{INSTALLED_EXE} not found: run claude-use --install first.")
     s = _load_claude_settings()
     current = (s.get("statusLine") or {}).get("command", "")
-    if current and not _is_clock_cmd(current):
+    if current and not _is_ours(current):
         sys.exit(f"{CLAUDE_SETTINGS} already has a status line ({current}).\n"
-                 "Remove it there first if you want the cache clock instead; nothing changed.")
-    s["statusLine"] = {"type": "command", "command": _clock_cmd("--statusline"), "padding": 0}
-    hooks = s.setdefault("hooks", {})
-    # async: Claude Code doesn't wait for the alarm to be set before the next prompt
-    for event, flag, opts in (("Stop", "--arm-clock", {"async": True, "timeout": 30}),
-                              ("SessionEnd", "--cancel-clock", {"timeout": 30})):
-        hooks[event] = _without_clock_hooks(hooks.get(event, [])) + [
-            {"hooks": [{"type": "command", "command": _clock_cmd(flag), **opts}]}]
+                 "Remove it there first if you want this one instead; nothing changed.")
+    s["statusLine"] = {"type": "command", "command": _our_cmd(STATUSLINE_FLAG), "padding": 0}
+    _strip_legacy_hooks(s)
     _save_claude_settings(s)
-    print(f"Cache clock on in {CLAUDE_SETTINGS}:\n"
-          f"  status line: cache warm until HH:MM\n"
-          f"  toast {CLOCK_WARN_S // 60} min before a session's cache expires\n"
-          "New Claude Code sessions pick it up; running ones may ask you to review the hooks (/hooks).")
+    print(f"Status line on in {CLAUDE_SETTINGS}: cache warm until HH:MM.\n"
+          "It also keeps the history current: once a day it imports in the background.")
 
 
-def disable_clock() -> bool:
-    """Remove the clock's settings entries and pending alarms. True if there were any."""
-    import subprocess
-
+def disable_statusline() -> bool:
+    """Remove our status line, and any 2.x hooks. True if there was either."""
     s = _load_claude_settings()
-    found = False
-    if _is_clock_cmd((s.get("statusLine") or {}).get("command", "")):
+    found = _strip_legacy_hooks(s)
+    if _is_ours((s.get("statusLine") or {}).get("command", "")):
         del s["statusLine"]
         found = True
-    hooks = s.get("hooks") or {}
-    for event in ("Stop", "SessionEnd"):
-        if event in hooks:
-            kept = _without_clock_hooks(hooks[event])
-            found |= len(kept) != len(hooks[event])
-            if kept:
-                hooks[event] = kept
-            else:
-                del hooks[event]
     if found:
         _save_claude_settings(s)
-        print(f"Removed the cache clock from {CLAUDE_SETTINGS}")
-
-    if sys.platform == "win32":
-        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                        "Get-ScheduledTask -TaskPath $env:CU_DIR -ErrorAction SilentlyContinue"
-                        " | Unregister-ScheduledTask -Confirm:$false"],
-                       env={**os.environ, "CU_DIR": CLOCK_TASKS}, capture_output=True)
-    elif sys.platform.startswith("linux") and shutil.which("systemctl"):
-        subprocess.run(["systemctl", "--user", "stop", f"{CLOCK_UNIT}-*.timer"], capture_output=True)
-    if CLOCK_PIDS.is_dir():
-        for f in CLOCK_PIDS.glob("*.pid"):
-            cancel_clock(f.stem)
+        print(f"Removed the claude-use status line from {CLAUDE_SETTINGS}")
     return found
 
 
@@ -1093,8 +847,12 @@ def uninstall() -> None:
         shutil.rmtree(OUT_HTML.parent)
         print(f"Removed {OUT_HTML.parent}")
     remove_installed_exe()
-    unschedule_import()
-    disable_clock()
+    remove_legacy_exe()
+    remove_legacy_jobs()
+    disable_statusline()
+    if IMPORT_STAMP.parent.exists():  # just the last-import stamp: not data
+        shutil.rmtree(IMPORT_STAMP.parent)
+        print(f"Removed {IMPORT_STAMP.parent}")
     warn_scheduled_tasks()
 
     left = [d for d in (CONFIG_FILE.parent, DEFAULT_DB.parent) if d.exists()]
@@ -1125,10 +883,13 @@ def install(data_dir: Path | None) -> None:
             shutil.copy2(exe, target)
         except PermissionError:
             sys.exit(f"Can't replace {target}: close the running claude-use"
-                     " (and any scheduled run), then install again.")
+                     " (and Claude Code, whose status line runs it), then install again.")
         print(f"Installed {target}")
 
+    remove_legacy_exe()
     create_entry_points()
+    remove_legacy_jobs()
+    migrate_claude_settings()
 
     for d in (CONFIG_FILE.parent, DEFAULT_DB.parent, OUT_HTML.parent):
         if not d.exists():
@@ -1293,6 +1054,8 @@ def update_history(db: Path, owned: Path | None) -> None:
         import_transcripts(db)
         if owned:
             snapshot(db, owned)
+    if db == DEFAULT_DB:
+        stamp_import()
 
 
 def collect(db: Path, owned: Path | None) -> dict:
@@ -1332,39 +1095,19 @@ def print_summary(data: dict) -> None:
               f'  ->  API would cost {total / sub:,.1f}x more' if sub else "")
 
 
-def install_extras(schedule_days: int | None, clock: bool) -> None:
-    """The opt-in steps after --install. One that can't be done is reported and
-    skipped, the rest still run, and the exit code says something was skipped."""
-    import subprocess
-
-    steps = []
-    if schedule_days:
-        steps.append((lambda: schedule_import(schedule_days),
-                      "claude-use --schedule-import" + (f" {schedule_days}" if schedule_days > 1 else "")))
-    if clock:
-        steps.append((enable_clock, "claude-use --enable-clock"))
-    skipped = []
-    for run, retry in steps:
-        print()
-        try:
-            run()
-        except (SystemExit, OSError, subprocess.CalledProcessError) as e:
-            if isinstance(e, SystemExit) and not e.code:
-                continue
-            print(f"Skipped: {e.code if isinstance(e, SystemExit) else e}")
-            skipped.append(retry)
-    if skipped:
-        print("\nInstalled, but not everything was set up. Once fixed, run:")
-        for retry in skipped:
-            print(f"  {retry}")
+def install_statusline() -> None:
+    """--install --all: the status line too. If it can't be added, the install
+    still stands, and the exit code says something was skipped."""
+    print()
+    try:
+        enable_statusline()
+    except (SystemExit, OSError) as e:
+        if isinstance(e, SystemExit) and not e.code:
+            return
+        print(f"Skipped: {e.code if isinstance(e, SystemExit) else e}")
+        print("\nInstalled, but without the status line. Once fixed, run:\n"
+              "  claude-use --enable-statusline")
         sys.exit(1)
-
-
-def _positive_int(s: str) -> int:
-    n = int(s)
-    if n < 1:
-        raise argparse.ArgumentTypeError(f"must be at least 1, not {n}")
-    return n
 
 
 def main() -> None:
@@ -1377,55 +1120,41 @@ def main() -> None:
                     help=f"use this history database instead of {DEFAULT_DB}"
                          " (no snapshot to data_dir)")
     ap.add_argument("--import-only", action="store_true",
-                    help="copy new transcript data into the DB and exit (for a scheduled task)")
+                    help="copy new transcript data into the DB and exit")
     ap.add_argument("--install", action="store_true",
                     help=f"copy this executable to {BIN_DIR} and set up its folders")
     ap.add_argument("--data-dir", type=Path, metavar="PATH",
                     help="with --install: back up the history DB to this folder")
     ap.add_argument("--all", action="store_true",
-                    help="with --install: also --schedule-import (daily unless DAYS is"
-                         " given) and --enable-clock")
+                    help="with --install: also --enable-statusline")
     ap.add_argument("--uninstall", action="store_true",
-                    help="remove the installed executable, its shortcuts and its"
-                         " scheduled import; keeps settings, history and backup")
-    ap.add_argument("--schedule-import", type=_positive_int, nargs="?", const=1,
-                    metavar="DAYS",
-                    help="run the installed executable with --import-only every DAYS"
-                         " days (default 1); run again to change it")
-    ap.add_argument("--unschedule-import", action="store_true",
-                    help="remove the job --schedule-import made")
-    ap.add_argument("--enable-clock", action="store_true",
-                    help="cache clock: add a status line with each session's cache expiry, and"
-                         f" a toast {CLOCK_WARN_S // 60} min before it, to ~/.claude/settings.json")
-    ap.add_argument("--disable-clock", action="store_true",
-                    help="remove the cache clock from ~/.claude/settings.json")
-    # run by Claude Code and by the alarm, not by hand
+                    help="remove the installed executable, its shortcuts and its status"
+                         " line; keeps settings, history and backup")
+    ap.add_argument("--enable-statusline", action="store_true",
+                    help="add a Claude Code status line with the session's cache expiry,"
+                         " which also imports once a day, to ~/.claude/settings.json")
+    ap.add_argument("--disable-statusline", action="store_true",
+                    help="remove that status line from ~/.claude/settings.json")
+    # run by Claude Code, not by hand
     ap.add_argument("--statusline", action="store_true", help=argparse.SUPPRESS)
+    # 2.x hooks and alarms that --install hasn't removed yet: accepted, ignored
     ap.add_argument("--arm-clock", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--cancel-clock", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--clock-fire", nargs=2, metavar=("SESSION", "TRANSCRIPT"), help=argparse.SUPPRESS)
+    ap.add_argument("--clock-fire", nargs=2, help=argparse.SUPPRESS)
     ap.add_argument("--clock-delay", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--pause", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--version", action="version", version=f"claude-use {__version__}")
     args = ap.parse_args()
 
-    # hooks first: they run after every response, so skip everything else
+    # the status line first: it runs on every redraw, so skip everything else
     if args.statusline:
         statusline()
         return
-    if args.arm_clock:
-        arm_clock()
+    if args.arm_clock or args.cancel_clock or args.clock_fire:
         return
-    if args.cancel_clock:
-        if hook := _hook_input():
-            cancel_clock(hook[0])
-        return
-    if args.clock_fire:
-        clock_fire(args.clock_fire[0], Path(args.clock_fire[1]), args.clock_delay)
-        return
-    if args.disable_clock:
-        if not disable_clock():
-            print("The cache clock isn't on.")
+    if args.disable_statusline:
+        if not disable_statusline():
+            print("The claude-use status line isn't on.")
         return
 
     for flag in ("data_dir", "all"):
@@ -1433,11 +1162,11 @@ def main() -> None:
             ap.error(f"--{flag.replace('_', '-')} only works with --install")
     if args.install:
         install(args.data_dir.expanduser().absolute() if args.data_dir else None)
-        install_extras(schedule_days=args.schedule_import or (1 if args.all else None),
-                       clock=args.enable_clock or args.all)
+        if args.enable_statusline or args.all:
+            install_statusline()
         return
-    if args.enable_clock:
-        enable_clock()
+    if args.enable_statusline:
+        enable_statusline()
         return
     if args.uninstall:
         uninstall()
@@ -1446,13 +1175,6 @@ def main() -> None:
                 input("\nPress Enter to close.")
             except EOFError:
                 pass
-        return
-    if args.schedule_import:
-        schedule_import(args.schedule_import)
-        return
-    if args.unschedule_import:
-        if not unschedule_import():
-            print("No scheduled import to remove.")
         return
 
     # --db is for one-off use, so only the default DB is seeded and snapshotted
